@@ -4,9 +4,10 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
-const JPEG_THUMBNAIL_READ_BYTES = 512 * 1024;
-const EMBEDDED_THUMBNAIL_SCAN_BYTES = 2 * 1024 * 1024;
-const EMBEDDED_THUMBNAIL_MAX_BYTES = 512 * 1024;
+const APP_CAMERA_MAX_LONG_EDGE = 1920;
+const APP_CAMERA_MAX_SHORT_EDGE = 1440;
+const APP_CAMERA_JPEG_QUALITY = 0.88;
+const APP_CAMERA_READY_TIMEOUT_MS = 8000;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -25,9 +26,15 @@ const els = {
   previewDetail: document.querySelector("#preview-detail"),
   previewContent: document.querySelector("#preview-content"),
   pickFile: document.querySelector("#pick-file"),
+  openAppCamera: document.querySelector("#open-app-camera"),
   openCamera: document.querySelector("#open-camera"),
   fileInput: document.querySelector("#file-input"),
   cameraInput: document.querySelector("#camera-input"),
+  appCameraPanel: document.querySelector("#app-camera-panel"),
+  appCameraVideo: document.querySelector("#app-camera-video"),
+  appCameraDetail: document.querySelector("#app-camera-detail"),
+  closeAppCamera: document.querySelector("#close-app-camera"),
+  captureAppCamera: document.querySelector("#capture-app-camera"),
   fileReviewPanel: document.querySelector("#file-review-panel"),
   fileReviewName: document.querySelector("#file-review-name"),
   fileReviewDetail: document.querySelector("#file-review-detail"),
@@ -43,6 +50,10 @@ const state = {
   pendingFile: null,
   pendingSource: null,
   pendingFileUrl: null,
+  appCameraStream: null,
+  appCameraRequestId: 0,
+  isOpeningAppCamera: false,
+  isCapturingAppCamera: false,
   incomingTransfers: new Map(),
   objectUrls: new Set(),
   isSending: false,
@@ -79,7 +90,10 @@ function bindEvents() {
   els.cameraInput.addEventListener("change", handleCameraPicked);
   els.chooseAnotherFile.addEventListener("click", chooseAnotherFile);
   els.sendSelectedFile.addEventListener("click", sendSelectedFile);
+  els.openAppCamera.addEventListener("click", openAppCamera);
   els.openCamera.addEventListener("click", openCamera);
+  els.closeAppCamera.addEventListener("click", closeAppCamera);
+  els.captureAppCamera.addEventListener("click", captureAppCamera);
 }
 
 function showUnsupported() {
@@ -550,20 +564,212 @@ async function handleCameraPicked(event) {
   setPhoneReady(false);
   els.phoneStatus.textContent = "撮影した写真を確認しています";
 
-  const [thumbnail, diagnostics] = await Promise.all([
-    extractEmbeddedThumbnail(file).catch(() => null),
-    readImageDiagnostics(file).catch(() => null),
-  ]);
-
   await showSelectedFilePreview(file, "camera", {
-    diagnostics,
-    previewBlob: thumbnail,
-    skipImagePreview: !thumbnail,
-    previewMessage: thumbnail ? null : "撮影した写真を選択しました。",
+    skipImagePreview: true,
+    previewMessage: "撮影した写真を選択しました。プレビューは省略しています。",
   });
-  els.phoneStatus.textContent = thumbnail
-    ? "撮影した写真のサムネイルを表示しています"
-    : "撮影した写真を選択しました。プレビューを省略しています";
+  els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
+}
+
+async function openAppCamera() {
+  clearPendingFile();
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    els.phoneStatus.textContent = "このブラウザではアプリ内カメラを利用できません。";
+    return;
+  }
+
+  stopAppCameraStream();
+  const requestId = state.appCameraRequestId + 1;
+  state.appCameraRequestId = requestId;
+  state.isOpeningAppCamera = true;
+  els.appCameraPanel.hidden = false;
+  els.appCameraDetail.textContent = "カメラを起動しています";
+  els.phoneStatus.textContent = "アプリ内カメラを起動しています";
+  setPhoneReady(false);
+
+  try {
+    const stream = await getBoundedCameraStream();
+    if (requestId !== state.appCameraRequestId) {
+      stopMediaStream(stream);
+      return;
+    }
+
+    state.appCameraStream = stream;
+    els.appCameraVideo.srcObject = stream;
+    await waitForVideoReady(els.appCameraVideo);
+    await els.appCameraVideo.play();
+    if (requestId !== state.appCameraRequestId) {
+      stopMediaStream(stream);
+      if (state.appCameraStream === stream) {
+        state.appCameraStream = null;
+        els.appCameraVideo.srcObject = null;
+      }
+      return;
+    }
+
+    updateAppCameraDetail();
+    els.phoneStatus.textContent = "アプリ内カメラで撮影できます";
+  } catch {
+    if (requestId === state.appCameraRequestId) {
+      stopAppCameraStream();
+      els.appCameraPanel.hidden = true;
+      els.phoneStatus.textContent = "アプリ内カメラを起動できませんでした。カメラを起動する方法を試してください。";
+      setPhoneReady(Boolean(state.conn?.open));
+    }
+  } finally {
+    if (requestId === state.appCameraRequestId) {
+      state.isOpeningAppCamera = false;
+      setPhoneReady(Boolean(state.conn?.open));
+    }
+  }
+}
+
+async function getBoundedCameraStream() {
+  const candidates = [
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1600, max: APP_CAMERA_MAX_LONG_EDGE },
+        height: { ideal: 1200, max: APP_CAMERA_MAX_LONG_EDGE },
+        resizeMode: "crop-and-scale",
+      },
+    },
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280, max: APP_CAMERA_MAX_LONG_EDGE },
+        height: { ideal: 960, max: APP_CAMERA_MAX_LONG_EDGE },
+      },
+    },
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+      },
+    },
+  ];
+
+  let lastError = null;
+  for (const constraints of candidates) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Camera unavailable");
+}
+
+function waitForVideoReady(video) {
+  if (video.videoWidth && video.videoHeight) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(handleTimeout, APP_CAMERA_READY_TIMEOUT_MS);
+    const cleanupListeners = () => {
+      window.clearTimeout(timeoutId);
+      video.removeEventListener("loadedmetadata", handleLoaded);
+      video.removeEventListener("error", handleError);
+    };
+    const handleLoaded = () => {
+      cleanupListeners();
+      resolve();
+    };
+    const handleError = () => {
+      cleanupListeners();
+      reject(new Error("Video unavailable"));
+    };
+    function handleTimeout() {
+      cleanupListeners();
+      reject(new Error("Video metadata timeout"));
+    }
+
+    video.addEventListener("loadedmetadata", handleLoaded);
+    video.addEventListener("error", handleError);
+  });
+}
+
+function updateAppCameraDetail() {
+  els.appCameraDetail.textContent =
+    `撮影後は長辺${APP_CAMERA_MAX_LONG_EDGE}px、短辺${APP_CAMERA_MAX_SHORT_EDGE}px以内で保存します`;
+}
+
+async function captureAppCamera() {
+  const video = els.appCameraVideo;
+  if (state.isCapturingAppCamera || !state.appCameraStream || !video.videoWidth || !video.videoHeight) return;
+
+  state.isCapturingAppCamera = true;
+  setPhoneReady(false);
+  els.phoneStatus.textContent = "撮影した写真を作成しています";
+
+  const canvas = document.createElement("canvas");
+  const size = calculateBoundedImageSize(video.videoWidth, video.videoHeight);
+  canvas.width = size.width;
+  canvas.height = size.height;
+
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) {
+    state.isCapturingAppCamera = false;
+    canvas.width = 0;
+    canvas.height = 0;
+    stopAppCameraStream();
+    els.phoneStatus.textContent = "撮影画像を作成できませんでした。";
+    setPhoneReady(Boolean(state.conn?.open));
+    return;
+  }
+
+  context.drawImage(video, 0, 0, size.width, size.height);
+
+  try {
+    const blob = await canvasToBlob(canvas, "image/jpeg", APP_CAMERA_JPEG_QUALITY);
+    const file = new File([blob], createCameraFileName(), {
+      type: "image/jpeg",
+      lastModified: Date.now(),
+    });
+
+    stopAppCameraStream();
+    await showSelectedFilePreview(file, "app-camera");
+    els.phoneStatus.textContent = "撮影した写真を確認してください";
+  } catch {
+    els.phoneStatus.textContent = "撮影画像を作成できませんでした。もう一度撮影してください。";
+    setPhoneReady(Boolean(state.conn?.open));
+  } finally {
+    state.isCapturingAppCamera = false;
+    canvas.width = 0;
+    canvas.height = 0;
+    setPhoneReady(Boolean(state.conn?.open));
+  }
+}
+
+function calculateBoundedImageSize(width, height) {
+  const longEdge = Math.max(width, height);
+  const shortEdge = Math.min(width, height);
+  const scale = Math.min(1, APP_CAMERA_MAX_LONG_EDGE / longEdge, APP_CAMERA_MAX_SHORT_EDGE / shortEdge);
+
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error("Failed to create image blob"));
+      }
+    }, type, quality);
+  });
+}
+
+function createCameraFileName() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `qr-transfer-camera-${timestamp}.jpg`;
 }
 
 async function showSelectedFilePreview(file, source, options = {}) {
@@ -577,8 +783,8 @@ async function showSelectedFilePreview(file, source, options = {}) {
 
   els.fileReviewPanel.hidden = false;
   els.fileReviewName.textContent = file.name;
-  els.fileReviewDetail.textContent = formatSelectedFileDetail(file, options.diagnostics);
-  els.chooseAnotherFile.textContent = source === "camera" ? "撮り直す" : "選び直す";
+  els.fileReviewDetail.textContent = formatSelectedFileDetail(file);
+  els.chooseAnotherFile.textContent = source === "camera" || source === "app-camera" ? "撮り直す" : "選び直す";
   if (url) {
     await renderFilePreview(els.fileReviewContent, {
       blob: previewBlob || file,
@@ -597,185 +803,8 @@ async function showSelectedFilePreview(file, source, options = {}) {
   setPhoneReady(Boolean(state.conn?.open));
 }
 
-async function readImageDiagnostics(file) {
-  if (!isJpegFile(file)) return null;
-
-  const dimensions = await readJpegDimensions(file);
-  return {
-    ...dimensions,
-    decodedBytes: dimensions.width * dimensions.height * 4,
-  };
-}
-
-async function readJpegDimensions(file) {
-  const buffer = await file.slice(0, Math.min(file.size, JPEG_THUMBNAIL_READ_BYTES)).arrayBuffer();
-  const view = new DataView(buffer);
-
-  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) {
-    throw new Error("Unsupported JPEG");
-  }
-
-  let offset = 2;
-  while (offset + 9 <= view.byteLength) {
-    if (view.getUint8(offset) !== 0xff) break;
-
-    const marker = view.getUint8(offset + 1);
-    if (marker === 0xda || marker === 0xd9) break;
-
-    const length = view.getUint16(offset + 2);
-    if (length < 2 || offset + 2 + length > view.byteLength) break;
-
-    if (isJpegStartOfFrame(marker)) {
-      return {
-        width: view.getUint16(offset + 7),
-        height: view.getUint16(offset + 5),
-      };
-    }
-
-    offset += 2 + length;
-  }
-
-  throw new Error("JPEG dimensions not found");
-}
-
-async function extractEmbeddedThumbnail(file) {
-  return (await extractJpegExifThumbnail(file)) || (await extractEmbeddedJpegPreview(file));
-}
-
-async function extractJpegExifThumbnail(file) {
-  const buffer = await file.slice(0, Math.min(file.size, JPEG_THUMBNAIL_READ_BYTES)).arrayBuffer();
-  const view = new DataView(buffer);
-
-  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null;
-
-  let offset = 2;
-  while (offset + 4 <= view.byteLength) {
-    if (view.getUint8(offset) !== 0xff) return null;
-
-    const marker = view.getUint8(offset + 1);
-    if (marker === 0xda || marker === 0xd9) return null;
-
-    const length = view.getUint16(offset + 2);
-    if (length < 2 || offset + 2 + length > view.byteLength) return null;
-
-    const segmentStart = offset + 4;
-    const segmentLength = length - 2;
-    if (marker === 0xe1 && readAscii(view, segmentStart, 6) === "Exif\0\0") {
-      return readExifThumbnail(view, segmentStart + 6, segmentLength - 6);
-    }
-
-    offset += 2 + length;
-  }
-
-  return null;
-}
-
-function readExifThumbnail(view, tiffStart, length) {
-  if (length < 14 || tiffStart + length > view.byteLength) return null;
-
-  const byteOrder = readAscii(view, tiffStart, 2);
-  const littleEndian = byteOrder === "II";
-  if (!littleEndian && byteOrder !== "MM") return null;
-
-  const getUint16 = (offset) => view.getUint16(offset, littleEndian);
-  const getUint32 = (offset) => view.getUint32(offset, littleEndian);
-  if (getUint16(tiffStart + 2) !== 42) return null;
-
-  const ifd0Offset = getUint32(tiffStart + 4);
-  const ifd1Offset = readNextIfdOffset(view, tiffStart, tiffStart + length, ifd0Offset, getUint16, getUint32);
-  if (!ifd1Offset) return null;
-
-  const entries = readIfdEntries(view, tiffStart, tiffStart + length, ifd1Offset, getUint16, getUint32);
-  const thumbnailOffset = entries.get(0x0201);
-  const thumbnailLength = entries.get(0x0202);
-  if (!thumbnailOffset || !thumbnailLength || thumbnailLength > EMBEDDED_THUMBNAIL_MAX_BYTES) return null;
-
-  const start = tiffStart + thumbnailOffset;
-  const end = start + thumbnailLength;
-  if (start < tiffStart || end > tiffStart + length || view.getUint16(start) !== 0xffd8) return null;
-
-  return new Blob([view.buffer.slice(start, end)], { type: "image/jpeg" });
-}
-
-function readNextIfdOffset(view, tiffStart, tiffEnd, ifdOffset, getUint16, getUint32) {
-  const entryCountOffset = tiffStart + ifdOffset;
-  if (entryCountOffset + 2 > tiffEnd) return 0;
-
-  const entryCount = getUint16(entryCountOffset);
-  const nextOffsetPosition = entryCountOffset + 2 + entryCount * 12;
-  if (nextOffsetPosition + 4 > tiffEnd) return 0;
-
-  return getUint32(nextOffsetPosition);
-}
-
-function readIfdEntries(view, tiffStart, tiffEnd, ifdOffset, getUint16, getUint32) {
-  const entries = new Map();
-  const entryCountOffset = tiffStart + ifdOffset;
-  if (entryCountOffset + 2 > tiffEnd) return entries;
-
-  const entryCount = getUint16(entryCountOffset);
-  for (let index = 0; index < entryCount; index += 1) {
-    const entryOffset = entryCountOffset + 2 + index * 12;
-    if (entryOffset + 12 > tiffEnd) break;
-    entries.set(getUint16(entryOffset), getUint32(entryOffset + 8));
-  }
-
-  return entries;
-}
-
-async function extractEmbeddedJpegPreview(file) {
-  if (file.type === "image/jpeg") return null;
-
-  const buffer = await file.slice(0, Math.min(file.size, EMBEDDED_THUMBNAIL_SCAN_BYTES)).arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) return null;
-
-  for (let start = 0; start + 4 < bytes.length; start += 1) {
-    if (bytes[start] !== 0xff || bytes[start + 1] !== 0xd8 || bytes[start + 2] !== 0xff) continue;
-
-    const endLimit = Math.min(bytes.length - 1, start + EMBEDDED_THUMBNAIL_MAX_BYTES);
-    for (let end = start + 4; end < endLimit; end += 1) {
-      if (bytes[end] === 0xff && bytes[end + 1] === 0xd9) {
-        return new Blob([buffer.slice(start, end + 2)], { type: "image/jpeg" });
-      }
-    }
-  }
-
-  return null;
-}
-
-function isJpegFile(file) {
-  return file.type === "image/jpeg" || /\.(jpe?g)$/i.test(file.name);
-}
-
-function isJpegStartOfFrame(marker) {
-  return (
-    (marker >= 0xc0 && marker <= 0xc3) ||
-    (marker >= 0xc5 && marker <= 0xc7) ||
-    (marker >= 0xc9 && marker <= 0xcb) ||
-    (marker >= 0xcd && marker <= 0xcf)
-  );
-}
-
-function readAscii(view, start, length) {
-  if (start + length > view.byteLength) return "";
-
-  let text = "";
-  for (let index = 0; index < length; index += 1) {
-    text += String.fromCharCode(view.getUint8(start + index));
-  }
-  return text;
-}
-
-function formatSelectedFileDetail(file, diagnostics) {
-  const parts = [formatBytes(file.size), file.type || "application/octet-stream"];
-
-  if (diagnostics?.width && diagnostics?.height) {
-    parts.push(`${diagnostics.width} x ${diagnostics.height}px`);
-    parts.push(`展開目安 ${formatBytes(diagnostics.decodedBytes)}`);
-  }
-
-  return parts.join(" / ");
+function formatSelectedFileDetail(file) {
+  return `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
 }
 
 function renderPreviewMessage(container, message) {
@@ -791,6 +820,11 @@ function renderPreviewMessage(container, message) {
 function chooseAnotherFile() {
   const source = state.pendingSource;
   clearPendingFile();
+  if (source === "app-camera") {
+    void openAppCamera();
+    return;
+  }
+
   if (source === "camera") {
     els.cameraInput.click();
     return;
@@ -809,6 +843,7 @@ async function sendSelectedFile() {
 }
 
 function clearPendingFile() {
+  stopAppCameraStream();
   state.pendingFile = null;
   state.pendingSource = null;
 
@@ -829,6 +864,30 @@ function clearPendingFile() {
 function openCamera() {
   clearPendingFile();
   els.cameraInput.click();
+}
+
+function closeAppCamera() {
+  stopAppCameraStream();
+  els.phoneStatus.textContent = "送信するファイルを選択してください";
+  setPhoneReady(Boolean(state.conn?.open));
+}
+
+function stopAppCameraStream() {
+  state.appCameraRequestId += 1;
+  stopMediaStream(state.appCameraStream);
+
+  state.appCameraStream = null;
+  state.isOpeningAppCamera = false;
+  els.appCameraVideo.pause();
+  els.appCameraVideo.srcObject = null;
+  els.appCameraPanel.hidden = true;
+  els.appCameraDetail.textContent = "";
+}
+
+function stopMediaStream(stream) {
+  for (const track of stream?.getTracks?.() || []) {
+    track.stop();
+  }
 }
 
 async function sendFile(file) {
@@ -917,6 +976,7 @@ function cleanup() {
   state.isClosing = true;
   window.clearTimeout(state.desktopRetryTimer);
   window.clearTimeout(state.phoneReconnectTimer);
+  stopAppCameraStream();
   for (const url of [...state.objectUrls]) {
     revokeObjectUrl(url);
   }
@@ -925,8 +985,13 @@ function cleanup() {
 }
 
 function setPhoneReady(isReady) {
-  els.pickFile.disabled = !isReady;
-  els.openCamera.disabled = !isReady;
+  const appCameraBusy = state.isOpeningAppCamera || Boolean(state.appCameraStream);
+
+  els.pickFile.disabled = !isReady || appCameraBusy;
+  els.openAppCamera.disabled = !isReady || appCameraBusy;
+  els.openCamera.disabled = !isReady || appCameraBusy;
+  els.captureAppCamera.disabled = !state.appCameraStream || state.isSending || state.isCapturingAppCamera;
+  els.closeAppCamera.disabled = state.isSending || state.isCapturingAppCamera;
   els.chooseAnotherFile.disabled = state.isSending;
   els.sendSelectedFile.disabled = !isReady || !state.pendingFile;
 }

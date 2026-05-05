@@ -76,17 +76,40 @@
               </svg>
               <span>ファイルから選択</span>
             </button>
+            <button id="open-app-camera" class="action-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M23 7l-7 5 7 5V7z" />
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+              </svg>
+              <span>アプリ内カメラで撮影</span>
+            </button>
             <button id="open-camera" class="action-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z" />
                 <circle cx="12" cy="13" r="3.5" />
               </svg>
-              <span>カメラで撮影</span>
+              <span>カメラを起動</span>
             </button>
           </div>
 
           <input id="file-input" type="file" hidden />
           <input id="camera-input" type="file" accept="image/*" capture="environment" hidden />
+
+          <section id="app-camera-panel" class="app-camera-panel" hidden>
+            <div class="section-heading">
+              <div>
+                <h2>アプリ内カメラ</h2>
+                <p id="app-camera-detail" class="preview-detail"></p>
+              </div>
+            </div>
+            <div class="app-camera-preview">
+              <video id="app-camera-video" autoplay muted playsinline></video>
+            </div>
+            <div class="app-camera-actions">
+              <button id="close-app-camera" class="secondary-button" type="button">キャンセル</button>
+              <button id="capture-app-camera" class="primary-button" type="button">撮影する</button>
+            </div>
+          </section>
 
           <section id="file-review-panel" class="file-review-panel" hidden>
             <div class="section-heading">
@@ -104,7 +127,7 @@
         </section>
 
         <section id="unsupported-view" class="view" hidden>
-          <p class="status-text">このブラウザではWebRTCまたはカメラ機能を利用できません。</p>
+          <p class="status-text">このブラウザではWebRTCを利用できません。</p>
         </section>
       </section>
     </main>

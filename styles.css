@@ -72,6 +72,7 @@ h2 {
 .qr-panel,
 .preview-area,
 .receive-area,
+.app-camera-panel,
 .file-review-panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -140,6 +141,7 @@ h2 {
 .qr-panel,
 .preview-area,
 .receive-area,
+.app-camera-panel,
 .file-review-panel {
   padding: 16px;
 }
@@ -213,6 +215,7 @@ h2 {
 }
 
 .receive-area,
+.app-camera-panel,
 .file-review-panel {
   margin-top: 20px;
 }
@@ -442,10 +445,15 @@ progress::-moz-progress-bar {
 }
 
 .action-grid,
+.app-camera-actions,
 .file-review-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.action-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .action-button {
@@ -468,6 +476,28 @@ progress::-moz-progress-bar {
 }
 
 .file-review-actions {
+  margin-top: 12px;
+}
+
+.app-camera-preview {
+  height: clamp(280px, 56vh, 520px);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #111827;
+}
+
+.app-camera-preview video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  background: #111827;
+}
+
+.app-camera-actions {
   margin-top: 12px;
 }
 
