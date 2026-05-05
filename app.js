@@ -4,6 +4,9 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
+const JPEG_THUMBNAIL_READ_BYTES = 512 * 1024;
+const EMBEDDED_THUMBNAIL_SCAN_BYTES = 2 * 1024 * 1024;
+const EMBEDDED_THUMBNAIL_MAX_BYTES = 512 * 1024;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -539,21 +542,28 @@ async function handleFilePicked(event) {
   await showSelectedFilePreview(file, "file");
 }
 
-function handleCameraPicked(event) {
+async function handleCameraPicked(event) {
   const [file] = event.target.files;
   event.target.value = "";
   if (!file) return;
 
-  void showSelectedFilePreview(file, "camera", {
-    skipImagePreview: true,
+  const thumbnail = await extractEmbeddedThumbnail(file).catch(() => null);
+
+  await showSelectedFilePreview(file, "camera", {
+    previewBlob: thumbnail,
+    skipImagePreview: !thumbnail,
+    previewMessage: thumbnail ? null : "撮影した写真を選択しました。",
   });
-  els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
+  els.phoneStatus.textContent = thumbnail
+    ? "撮影した写真のサムネイルを表示しています"
+    : "撮影した写真を選択しました。プレビューを省略しています";
 }
 
 async function showSelectedFilePreview(file, source, options = {}) {
   clearPendingFile();
 
-  const url = options.skipImagePreview ? null : createObjectUrl(file);
+  const previewBlob = options.previewBlob || null;
+  const url = previewBlob ? createObjectUrl(previewBlob) : options.skipImagePreview ? null : createObjectUrl(file);
   state.pendingFile = file;
   state.pendingSource = source;
   state.pendingFileUrl = url;
@@ -564,20 +574,136 @@ async function showSelectedFilePreview(file, source, options = {}) {
   els.chooseAnotherFile.textContent = source === "camera" ? "撮り直す" : "選び直す";
   if (url) {
     await renderFilePreview(els.fileReviewContent, {
-      blob: file,
+      blob: previewBlob || file,
       meta: {
         name: file.name,
-        mime: file.type,
+        mime: previewBlob?.type || file.type,
       },
       url,
     });
   } else {
-    renderPreviewMessage(els.fileReviewContent, "撮影した写真を選択しました。");
+    renderPreviewMessage(els.fileReviewContent, options.previewMessage || "撮影した写真を選択しました。");
   }
   if (source !== "camera") {
     els.phoneStatus.textContent = "送信するファイルを確認してください";
   }
   setPhoneReady(Boolean(state.conn?.open));
+}
+
+async function extractEmbeddedThumbnail(file) {
+  return (await extractJpegExifThumbnail(file)) || (await extractEmbeddedJpegPreview(file));
+}
+
+async function extractJpegExifThumbnail(file) {
+  const buffer = await file.slice(0, Math.min(file.size, JPEG_THUMBNAIL_READ_BYTES)).arrayBuffer();
+  const view = new DataView(buffer);
+
+  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null;
+
+  let offset = 2;
+  while (offset + 4 <= view.byteLength) {
+    if (view.getUint8(offset) !== 0xff) return null;
+
+    const marker = view.getUint8(offset + 1);
+    if (marker === 0xda || marker === 0xd9) return null;
+
+    const length = view.getUint16(offset + 2);
+    if (length < 2 || offset + 2 + length > view.byteLength) return null;
+
+    const segmentStart = offset + 4;
+    const segmentLength = length - 2;
+    if (marker === 0xe1 && readAscii(view, segmentStart, 6) === "Exif\0\0") {
+      return readExifThumbnail(view, segmentStart + 6, segmentLength - 6);
+    }
+
+    offset += 2 + length;
+  }
+
+  return null;
+}
+
+function readExifThumbnail(view, tiffStart, length) {
+  if (length < 14 || tiffStart + length > view.byteLength) return null;
+
+  const byteOrder = readAscii(view, tiffStart, 2);
+  const littleEndian = byteOrder === "II";
+  if (!littleEndian && byteOrder !== "MM") return null;
+
+  const getUint16 = (offset) => view.getUint16(offset, littleEndian);
+  const getUint32 = (offset) => view.getUint32(offset, littleEndian);
+  if (getUint16(tiffStart + 2) !== 42) return null;
+
+  const ifd0Offset = getUint32(tiffStart + 4);
+  const ifd1Offset = readNextIfdOffset(view, tiffStart, tiffStart + length, ifd0Offset, getUint16, getUint32);
+  if (!ifd1Offset) return null;
+
+  const entries = readIfdEntries(view, tiffStart, tiffStart + length, ifd1Offset, getUint16, getUint32);
+  const thumbnailOffset = entries.get(0x0201);
+  const thumbnailLength = entries.get(0x0202);
+  if (!thumbnailOffset || !thumbnailLength || thumbnailLength > EMBEDDED_THUMBNAIL_MAX_BYTES) return null;
+
+  const start = tiffStart + thumbnailOffset;
+  const end = start + thumbnailLength;
+  if (start < tiffStart || end > tiffStart + length || view.getUint16(start) !== 0xffd8) return null;
+
+  return new Blob([view.buffer.slice(start, end)], { type: "image/jpeg" });
+}
+
+function readNextIfdOffset(view, tiffStart, tiffEnd, ifdOffset, getUint16, getUint32) {
+  const entryCountOffset = tiffStart + ifdOffset;
+  if (entryCountOffset + 2 > tiffEnd) return 0;
+
+  const entryCount = getUint16(entryCountOffset);
+  const nextOffsetPosition = entryCountOffset + 2 + entryCount * 12;
+  if (nextOffsetPosition + 4 > tiffEnd) return 0;
+
+  return getUint32(nextOffsetPosition);
+}
+
+function readIfdEntries(view, tiffStart, tiffEnd, ifdOffset, getUint16, getUint32) {
+  const entries = new Map();
+  const entryCountOffset = tiffStart + ifdOffset;
+  if (entryCountOffset + 2 > tiffEnd) return entries;
+
+  const entryCount = getUint16(entryCountOffset);
+  for (let index = 0; index < entryCount; index += 1) {
+    const entryOffset = entryCountOffset + 2 + index * 12;
+    if (entryOffset + 12 > tiffEnd) break;
+    entries.set(getUint16(entryOffset), getUint32(entryOffset + 8));
+  }
+
+  return entries;
+}
+
+async function extractEmbeddedJpegPreview(file) {
+  if (file.type === "image/jpeg") return null;
+
+  const buffer = await file.slice(0, Math.min(file.size, EMBEDDED_THUMBNAIL_SCAN_BYTES)).arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return null;
+
+  for (let start = 0; start + 4 < bytes.length; start += 1) {
+    if (bytes[start] !== 0xff || bytes[start + 1] !== 0xd8 || bytes[start + 2] !== 0xff) continue;
+
+    const endLimit = Math.min(bytes.length - 1, start + EMBEDDED_THUMBNAIL_MAX_BYTES);
+    for (let end = start + 4; end < endLimit; end += 1) {
+      if (bytes[end] === 0xff && bytes[end + 1] === 0xd9) {
+        return new Blob([buffer.slice(start, end + 2)], { type: "image/jpeg" });
+      }
+    }
+  }
+
+  return null;
+}
+
+function readAscii(view, start, length) {
+  if (start + length > view.byteLength) return "";
+
+  let text = "";
+  for (let index = 0; index < length; index += 1) {
+    text += String.fromCharCode(view.getUint8(start + index));
+  }
+  return text;
 }
 
 function renderPreviewMessage(container, message) {
