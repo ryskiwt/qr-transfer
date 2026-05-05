@@ -10,6 +10,9 @@ const APP_CAMERA_JPEG_QUALITY = 0.88;
 const APP_CAMERA_READY_TIMEOUT_MS = 8000;
 const FILE_IMAGE_PREVIEW_MAX_PIXELS = 8 * 1000 * 1000;
 const IMAGE_HEADER_READ_BYTES = 512 * 1024;
+const DEBUG_LOG_STORAGE_KEY = "qr-transfer-debug-log";
+const DEBUG_LOG_LIMIT = 100;
+const DEBUG_STRING_LIMIT = 500;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -46,6 +49,9 @@ const els = {
   fileReviewContent: document.querySelector("#file-review-content"),
   chooseAnotherFile: document.querySelector("#choose-another-file"),
   sendSelectedFile: document.querySelector("#send-selected-file"),
+  debugLogPanel: document.querySelector("#debug-log-panel"),
+  debugLogOutput: document.querySelector("#debug-log-output"),
+  clearDebugLog: document.querySelector("#clear-debug-log"),
 };
 
 const state = {
@@ -71,13 +77,58 @@ const state = {
   desktopRetryTimer: null,
   phoneReconnectTimer: null,
   phoneReconnectAttempts: 0,
+  debugLogs: [],
 };
 
 window.addEventListener("DOMContentLoaded", init);
 window.addEventListener("beforeunload", cleanup);
+window.addEventListener("error", (event) => {
+  logDebug("window-error", {
+    message: event.message,
+    source: event.filename,
+    line: event.lineno,
+    column: event.colno,
+    error: formatDebugError(event.error),
+  });
+});
+window.addEventListener("unhandledrejection", (event) => {
+  logDebug("unhandled-rejection", {
+    reason: formatDebugError(event.reason),
+  });
+});
+window.addEventListener("pagehide", (event) => {
+  logDebug("pagehide", { persisted: event.persisted });
+});
+window.addEventListener("pageshow", (event) => {
+  logDebug("pageshow", { persisted: event.persisted });
+});
+window.addEventListener("focus", () => {
+  logDebug("window-focus");
+});
+window.addEventListener("blur", () => {
+  logDebug("window-blur");
+});
+document.addEventListener("visibilitychange", () => {
+  logDebug("visibilitychange", {
+    hidden: document.hidden,
+    visibilityState: document.visibilityState,
+  });
+});
 
 function init() {
+  logDebug("init-start", {
+    href: window.location.href,
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    deviceMemory: navigator.deviceMemory || null,
+    hardwareConcurrency: navigator.hardwareConcurrency || null,
+  });
+
   if (!window.Peer || !window.RTCPeerConnection) {
+    logDebug("unsupported-browser", {
+      hasPeer: Boolean(window.Peer),
+      hasWebRTC: Boolean(window.RTCPeerConnection),
+    });
     showUnsupported();
     return;
   }
@@ -95,7 +146,13 @@ function init() {
 }
 
 function bindEvents() {
-  els.pickFile.addEventListener("click", () => els.fileInput.click());
+  els.pickFile.addEventListener("click", () => {
+    logDebug("file-input-open", {
+      accept: els.fileInput.accept || "",
+      capture: els.fileInput.getAttribute("capture") || "",
+    });
+    els.fileInput.click();
+  });
   els.fileInput.addEventListener("change", handleFilePicked);
   els.chooseAnotherFile.addEventListener("click", chooseAnotherFile);
   els.sendSelectedFile.addEventListener("click", sendSelectedFile);
@@ -105,7 +162,9 @@ function bindEvents() {
   els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
   els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
   els.previewOverlay.addEventListener("click", handlePreviewOverlayClick);
+  els.clearDebugLog.addEventListener("click", clearDebugLog);
   document.addEventListener("keydown", handleDocumentKeydown);
+  renderDebugLog();
 }
 
 function showUnsupported() {
@@ -117,6 +176,7 @@ function showUnsupported() {
 }
 
 function startDesktop() {
+  logDebug("start-desktop");
   els.viewTitle.textContent = "WebRTCでファイルを受信";
   setPill("接続準備中");
   els.desktopView.hidden = false;
@@ -170,6 +230,9 @@ function createDesktopPeer(peerId, retryCount = 0) {
 }
 
 function startPhone(targetPeerId) {
+  logDebug("start-phone", {
+    peer: formatDebugPeerId(targetPeerId),
+  });
   els.viewTitle.textContent = "WebRTCでファイルを送信";
   setPill("接続中", "warn");
   els.desktopView.hidden = true;
@@ -554,8 +617,13 @@ async function renderFilePreview(container, { blob, meta, url }) {
   container.replaceChildren();
   container.dataset.previewKind = "empty";
   const mime = blob.type || meta.mime || "";
+  const target = container.id || container.className || "preview";
 
   if (isTextPreviewable(meta.name, mime, blob.size)) {
+    logDebug("render-preview-text", {
+      target,
+      file: describePreviewFile(blob, meta),
+    });
     container.dataset.previewKind = "text";
     const pre = document.createElement("pre");
     pre.className = "preview-text";
@@ -565,8 +633,34 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("image/")) {
+    logDebug("render-preview-image-append", {
+      target,
+      file: describePreviewFile(blob, meta),
+    });
     container.dataset.previewKind = "image";
     const image = document.createElement("img");
+    image.addEventListener(
+      "load",
+      () => {
+        logDebug("render-preview-image-load", {
+          target,
+          naturalWidth: image.naturalWidth,
+          naturalHeight: image.naturalHeight,
+          file: describePreviewFile(blob, meta),
+        });
+      },
+      { once: true },
+    );
+    image.addEventListener(
+      "error",
+      () => {
+        logDebug("render-preview-image-error", {
+          target,
+          file: describePreviewFile(blob, meta),
+        });
+      },
+      { once: true },
+    );
     image.src = url;
     image.alt = `${meta.name} のプレビュー`;
     container.append(image);
@@ -574,6 +668,10 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("video/")) {
+    logDebug("render-preview-video", {
+      target,
+      file: describePreviewFile(blob, meta),
+    });
     container.dataset.previewKind = "video";
     const video = document.createElement("video");
     video.src = url;
@@ -584,6 +682,10 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("audio/")) {
+    logDebug("render-preview-audio", {
+      target,
+      file: describePreviewFile(blob, meta),
+    });
     container.dataset.previewKind = "audio";
     const audio = document.createElement("audio");
     audio.src = url;
@@ -593,6 +695,10 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime === "application/pdf") {
+    logDebug("render-preview-pdf", {
+      target,
+      file: describePreviewFile(blob, meta),
+    });
     container.dataset.previewKind = "pdf";
     const frame = document.createElement("iframe");
     frame.src = url;
@@ -601,6 +707,10 @@ async function renderFilePreview(container, { blob, meta, url }) {
     return;
   }
 
+  logDebug("render-preview-unsupported", {
+    target,
+    file: describePreviewFile(blob, meta),
+  });
   const empty = document.createElement("p");
   empty.className = "preview-empty";
   empty.textContent = "このファイル形式はブラウザ内プレビューに対応していません。";
@@ -608,11 +718,30 @@ async function renderFilePreview(container, { blob, meta, url }) {
 }
 
 async function handleFilePicked(event) {
-  const [file] = event.target.files;
-  event.target.value = "";
-  if (!file) return;
+  const files = event.target.files || [];
+  logDebug("file-input-change", { fileCount: files.length });
 
-  await showSelectedFilePreview(file, "file");
+  const [file] = files;
+  event.target.value = "";
+  if (!file) {
+    logDebug("file-input-empty");
+    return;
+  }
+
+  logDebug("file-input-picked", {
+    file: describeFile(file),
+  });
+
+  try {
+    await showSelectedFilePreview(file, "file");
+  } catch (error) {
+    logDebug("file-input-preview-error", {
+      file: describeFile(file),
+      error: formatDebugError(error),
+    });
+    els.phoneStatus.textContent = "プレビュー処理中にエラーが発生しました。送信はやり直してください。";
+    clearPendingFile();
+  }
 }
 
 async function openAppCamera() {
@@ -917,6 +1046,10 @@ function createCameraFileName() {
 
 async function showSelectedFilePreview(file, source) {
   clearPendingFile();
+  logDebug("selected-file-start", {
+    source,
+    file: describeFile(file),
+  });
 
   const skipPreviewMessage = await getSelectedFilePreviewSkipMessage(file, source);
   const url = skipPreviewMessage ? null : createObjectUrl(file);
@@ -929,6 +1062,10 @@ async function showSelectedFilePreview(file, source) {
   els.fileReviewDetail.textContent = formatSelectedFileDetail(file);
   els.chooseAnotherFile.textContent = source === "app-camera" ? "撮り直す" : "選び直す";
   if (url) {
+    logDebug("selected-file-render-start", {
+      source,
+      file: describeFile(file),
+    });
     await renderFilePreview(els.fileReviewContent, {
       blob: file,
       meta: {
@@ -937,7 +1074,16 @@ async function showSelectedFilePreview(file, source) {
       },
       url,
     });
+    logDebug("selected-file-render-end", {
+      source,
+      file: describeFile(file),
+    });
   } else {
+    logDebug("selected-file-preview-skipped", {
+      source,
+      file: describeFile(file),
+      message: skipPreviewMessage,
+    });
     renderPreviewMessage(els.fileReviewContent, skipPreviewMessage);
   }
   els.phoneStatus.textContent = "送信するファイルを確認してください";
@@ -945,17 +1091,63 @@ async function showSelectedFilePreview(file, source) {
 }
 
 async function getSelectedFilePreviewSkipMessage(file, source) {
-  if (source !== "file" || !isImageFile(file)) return "";
-  if (isSvgFile(file)) return "";
+  if (source !== "file" || !isImageFile(file)) {
+    logDebug("preview-check-not-target", {
+      source,
+      file: describeFile(file),
+    });
+    return "";
+  }
 
-  const dimensions = await readImageDimensions(file).catch(() => null);
+  if (isSvgFile(file)) {
+    logDebug("preview-check-svg", {
+      file: describeFile(file),
+    });
+    return "";
+  }
+
+  logDebug("preview-check-start", {
+    maxPixels: FILE_IMAGE_PREVIEW_MAX_PIXELS,
+    file: describeFile(file),
+  });
+
+  let dimensions = null;
+  try {
+    dimensions = await readImageDimensions(file);
+  } catch (error) {
+    logDebug("preview-dimensions-error", {
+      file: describeFile(file),
+      error: formatDebugError(error),
+    });
+  }
+
   if (!dimensions) {
+    logDebug("preview-dimensions-unknown", {
+      file: describeFile(file),
+    });
     return `画像サイズを安全に確認できないためスマートフォン側プレビューを省略します。${formatBytes(file.size)}`;
   }
 
   const pixels = dimensions.width * dimensions.height;
-  if (pixels <= FILE_IMAGE_PREVIEW_MAX_PIXELS) return "";
+  logDebug("preview-dimensions-read", {
+    width: dimensions.width,
+    height: dimensions.height,
+    pixels,
+    file: describeFile(file),
+  });
 
+  if (pixels <= FILE_IMAGE_PREVIEW_MAX_PIXELS) {
+    logDebug("preview-check-allowed", {
+      pixels,
+      file: describeFile(file),
+    });
+    return "";
+  }
+
+  logDebug("preview-check-too-large", {
+    pixels,
+    file: describeFile(file),
+  });
   return `画像が大きいためスマートフォン側プレビューを省略します。${dimensions.width} x ${dimensions.height}px / ${formatBytes(file.size)}`;
 }
 
@@ -1112,6 +1304,139 @@ function formatSelectedFileDetail(file) {
   return `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
 }
 
+function logDebug(event, data = {}) {
+  const entry = {
+    time: new Date().toISOString(),
+    event,
+    data: safeDebugData(data),
+  };
+  const logs = readDebugLogs();
+  logs.push(entry);
+  const trimmedLogs = logs.slice(-DEBUG_LOG_LIMIT);
+  writeDebugLogs(trimmedLogs);
+  renderDebugLog(trimmedLogs);
+
+  if (console?.debug) {
+    console.debug("[QR Transfer]", event, entry.data);
+  }
+}
+
+function readDebugLogs() {
+  try {
+    const value = window.localStorage?.getItem(DEBUG_LOG_STORAGE_KEY);
+    const logs = value ? JSON.parse(value) : [];
+    state.debugLogs = Array.isArray(logs) ? logs : [];
+  } catch {
+    state.debugLogs = Array.isArray(state.debugLogs) ? state.debugLogs : [];
+  }
+
+  return state.debugLogs;
+}
+
+function writeDebugLogs(logs) {
+  state.debugLogs = logs;
+
+  try {
+    window.localStorage?.setItem(DEBUG_LOG_STORAGE_KEY, JSON.stringify(logs));
+  } catch {
+    // Storage failures should never affect transfer behavior.
+  }
+}
+
+function renderDebugLog(logs = readDebugLogs()) {
+  if (!els.debugLogPanel || !els.debugLogOutput) return;
+
+  els.debugLogPanel.hidden = logs.length === 0;
+  els.debugLogOutput.textContent = logs.map(formatDebugLogEntry).join("\n");
+}
+
+function clearDebugLog() {
+  state.debugLogs = [];
+
+  try {
+    window.localStorage?.removeItem(DEBUG_LOG_STORAGE_KEY);
+  } catch {
+    // Ignore storage cleanup failures.
+  }
+
+  renderDebugLog([]);
+}
+
+function formatDebugLogEntry(entry) {
+  const detail = entry.data && Object.keys(entry.data).length > 0 ? ` ${JSON.stringify(entry.data)}` : "";
+  return `${entry.time} ${entry.event}${detail}`;
+}
+
+function safeDebugData(data) {
+  try {
+    const json = JSON.stringify(data, (_key, value) => normalizeDebugValue(value));
+    return json ? JSON.parse(json) : {};
+  } catch (error) {
+    return {
+      serializationError: formatDebugError(error),
+    };
+  }
+}
+
+function normalizeDebugValue(value) {
+  if (value instanceof Error) return formatDebugError(value);
+  if (typeof File !== "undefined" && value instanceof File) return describeFile(value);
+  if (typeof Blob !== "undefined" && value instanceof Blob) return describePreviewFile(value, {});
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && value.length > DEBUG_STRING_LIMIT) {
+    return `${value.slice(0, DEBUG_STRING_LIMIT)}...`;
+  }
+
+  return value;
+}
+
+function formatDebugError(error) {
+  if (!error) return null;
+
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: trimDebugString(error.stack || ""),
+    };
+  }
+
+  if (typeof error === "object") {
+    return safeDebugData(error);
+  }
+
+  return trimDebugString(String(error));
+}
+
+function describeFile(file) {
+  return {
+    name: file.name || "",
+    type: file.type || "",
+    size: file.size,
+    sizeLabel: formatBytes(file.size || 0),
+    lastModified: file.lastModified || null,
+  };
+}
+
+function describePreviewFile(blob, meta) {
+  return {
+    name: meta.name || "",
+    type: blob.type || meta.mime || "",
+    size: blob.size,
+    sizeLabel: formatBytes(blob.size || 0),
+  };
+}
+
+function trimDebugString(value) {
+  if (!value || value.length <= DEBUG_STRING_LIMIT) return value;
+  return `${value.slice(0, DEBUG_STRING_LIMIT)}...`;
+}
+
+function formatDebugPeerId(peerId) {
+  if (!peerId) return "";
+  return peerId.length > 16 ? `${peerId.slice(0, 8)}...${peerId.slice(-4)}` : peerId;
+}
+
 function renderPreviewMessage(container, message) {
   container.replaceChildren();
   container.dataset.previewKind = "empty";
@@ -1137,6 +1462,10 @@ async function sendSelectedFile() {
   if (!state.pendingFile) return;
 
   const source = state.pendingSource;
+  logDebug("send-selected-file", {
+    source,
+    file: describeFile(state.pendingFile),
+  });
   const didSend = await sendFile(state.pendingFile);
   if (didSend && source !== "app-camera") {
     clearPendingFile();
@@ -1198,6 +1527,11 @@ async function sendFile(file) {
 
   const id = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const totalChunks = Math.max(1, Math.ceil(file.size / TRANSFER_CHUNK_SIZE));
+  logDebug("send-file-start", {
+    id,
+    totalChunks,
+    file: describeFile(file),
+  });
 
   conn.send({
     type: "file-meta",
@@ -1233,7 +1567,17 @@ async function sendFile(file) {
     setPill("送信完了", "success");
     els.phoneStatus.textContent = "送信が完了しました。続けて別のファイルも送信できます";
     didSend = true;
-  } catch {
+    logDebug("send-file-complete", {
+      id,
+      totalChunks,
+      file: describeFile(file),
+    });
+  } catch (error) {
+    logDebug("send-file-error", {
+      id,
+      file: describeFile(file),
+      error: formatDebugError(error),
+    });
     setPill("送信エラー", "error");
     els.phoneStatus.textContent = "送信中にエラーが発生しました。接続を確認してやり直してください。";
   } finally {

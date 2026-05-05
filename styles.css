@@ -73,7 +73,8 @@ h2 {
 .preview-area,
 .receive-area,
 .app-camera-panel,
-.file-review-panel {
+.file-review-panel,
+.debug-log-panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -216,8 +217,39 @@ h2 {
 
 .receive-area,
 .app-camera-panel,
-.file-review-panel {
+.file-review-panel,
+.debug-log-panel {
   margin-top: 20px;
+}
+
+.debug-log-panel {
+  padding: 12px;
+}
+
+.debug-log-panel summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.debug-log-output {
+  max-height: 220px;
+  margin: 12px 0;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f172a;
+  color: #d1e7ff;
+  font:
+    0.78rem/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.debug-log-clear {
+  width: 100%;
 }
 
 .section-heading {
