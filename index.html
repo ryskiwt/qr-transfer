@@ -3,20 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; frame-src blob:; connect-src 'self' https://*.peerjs.com:* wss://*.peerjs.com:* stun: turn:"
+    />
     <title>QR Transfer</title>
     <link rel="stylesheet" href="./styles.css" />
-    <script
-      src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"
-      integrity="sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu"
-      crossorigin="anonymous"
-      defer
-    ></script>
-    <script
-      src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
-      integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"
-      crossorigin="anonymous"
-      defer
-    ></script>
+    <script src="./vendor/peerjs.min.js" defer></script>
+    <script src="./vendor/qrcode.min.js" defer></script>
     <script src="./app.js" defer></script>
   </head>
   <body>
@@ -34,7 +29,10 @@
                 <div id="qr-code" class="qr-code" role="img" aria-label="スマートフォン接続用QRコード"></div>
                 <div id="qr-loading" class="qr-loading">QRコードを生成中</div>
               </div>
-              <a id="phone-link" class="text-link" href="#" target="_blank" rel="noreferrer">スマートフォン用リンクを開く</a>
+              <div class="qr-actions">
+                <a id="phone-link" class="text-link" href="#" target="_blank" rel="noreferrer">スマートフォン用リンクを開く</a>
+                <button id="refresh-qr" class="secondary-button" type="button">QRを再発行</button>
+              </div>
             </div>
 
             <section id="preview-area" class="preview-area" aria-label="受信ファイルプレビュー">

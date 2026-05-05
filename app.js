@@ -1,7 +1,14 @@
 const TRANSFER_CHUNK_SIZE = 64 * 1024;
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const TEXT_PREVIEW_LIMIT = 1024 * 1024;
-const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
+const OBSOLETE_DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
+const SESSION_SECRET_BYTES = 32;
+const AUTH_NONCE_BYTES = 16;
+const AES_GCM_IV_BYTES = 12;
+const SECURE_PROTOCOL_VERSION = 1;
+const MAX_TRANSFER_CHUNKS = 65536;
+const MAX_FILE_NAME_LENGTH = 255;
+const MAX_MIME_LENGTH = 128;
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
 const APP_CAMERA_MAX_LONG_EDGE = 1920;
@@ -20,6 +27,7 @@ const els = {
   qrCode: document.querySelector("#qr-code"),
   qrLoading: document.querySelector("#qr-loading"),
   phoneLink: document.querySelector("#phone-link"),
+  refreshQr: document.querySelector("#refresh-qr"),
   desktopStatus: document.querySelector("#desktop-status"),
   phoneStatus: document.querySelector("#phone-status-text"),
   sendProgress: document.querySelector("#send-progress"),
@@ -51,7 +59,12 @@ const els = {
 const state = {
   peer: null,
   conn: null,
+  connAuthenticated: false,
   targetPeerId: null,
+  sessionSecret: null,
+  sessionKeys: null,
+  authNonce: null,
+  phoneAuthFailed: false,
   pendingFile: null,
   pendingSource: null,
   pendingFileUrl: null,
@@ -71,6 +84,7 @@ const state = {
   desktopRetryTimer: null,
   phoneReconnectTimer: null,
   phoneReconnectAttempts: 0,
+  receiverQueue: Promise.resolve(),
 };
 
 window.addEventListener("DOMContentLoaded", init);
@@ -79,8 +93,8 @@ window.addEventListener("beforeunload", cleanup);
 function init() {
   clearObsoleteStorage();
 
-  if (!window.Peer || !window.RTCPeerConnection) {
-    showUnsupported();
+  if (!window.Peer || !window.RTCPeerConnection || !isSecureCryptoSupported()) {
+    showUnsupported("このブラウザではWebRTCまたは安全な暗号化を利用できません。");
     return;
   }
 
@@ -90,9 +104,14 @@ function init() {
   const targetPeerId = params.get("peer");
 
   if (targetPeerId) {
-    startPhone(targetPeerId);
+    void startPhone(targetPeerId, readSessionSecretFromHash()).catch(() => {
+      setPill("暗号化エラー", "error");
+      els.phoneStatus.textContent = "暗号鍵を準備できませんでした。QRコードを読み取り直してください。";
+    });
   } else {
-    startDesktop();
+    void startDesktop().catch(() => {
+      showUnsupported("暗号鍵を準備できませんでした。HTTPSまたはlocalhostで開いてください。");
+    });
   }
 }
 
@@ -106,57 +125,86 @@ function bindEvents() {
   els.captureAppCamera.addEventListener("click", captureAppCamera);
   els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
   els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
+  els.refreshQr.addEventListener("click", refreshDesktopSession);
   els.previewOverlay.addEventListener("click", handlePreviewOverlayClick);
   document.addEventListener("keydown", handleDocumentKeydown);
 }
 
-function showUnsupported() {
+function showUnsupported(message = "このブラウザではWebRTCを利用できません。") {
   els.viewTitle.textContent = "WebRTCを利用できません";
   setPill("非対応", "error");
   els.desktopView.hidden = true;
   els.phoneView.hidden = true;
   els.unsupportedView.hidden = false;
+  const status = els.unsupportedView.querySelector(".status-text");
+  if (status) status.textContent = message;
 }
 
-function startDesktop() {
+async function startDesktop() {
   els.viewTitle.textContent = "WebRTCでファイルを受信";
   setPill("接続準備中");
   els.desktopView.hidden = false;
   els.phoneView.hidden = true;
   els.unsupportedView.hidden = true;
+  setDesktopQrBusy("暗号鍵を準備中");
 
-  const peerId = getDesktopPeerId();
+  const peerId = createPeerId();
+  const sessionSecret = createSessionSecret();
+  state.sessionSecret = sessionSecret;
+  state.sessionKeys = await deriveSessionKeys(sessionSecret);
   ensureDesktopUrlHasRoom(peerId);
   createDesktopPeer(peerId);
 }
 
 function createDesktopPeer(peerId, retryCount = 0) {
   window.clearTimeout(state.desktopRetryTimer);
+  setDesktopQrBusy(retryCount ? "接続IDを再利用できるまで待っています" : "QRコードを生成中");
 
   if (state.peer && !state.peer.destroyed) {
     state.peer.destroy();
   }
+  state.conn?.close?.();
+  state.conn = null;
+  state.connAuthenticated = false;
+  state.authNonce = null;
+  state.incomingTransfers.clear();
+  state.receiverQueue = Promise.resolve();
 
   const peer = createPeer(peerId);
   state.peer = peer;
 
   peer.on("open", (id) => {
+    if (state.peer !== peer || state.isClosing) return;
+
     setPill("待機中", "warn");
     els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
 
-    const phoneUrl = buildPhoneUrl(id);
+    const phoneUrl = buildPhoneUrl(id, state.sessionSecret);
     els.phoneLink.href = phoneUrl;
     els.phoneLink.textContent = formatPhoneUrlLabel(phoneUrl);
-    els.phoneLink.title = phoneUrl;
+    els.phoneLink.title = els.phoneLink.textContent;
     renderQr(phoneUrl);
   });
 
   peer.on("connection", (conn) => {
+    if (state.peer !== peer || state.isClosing) {
+      conn.close();
+      return;
+    }
+
+    if (state.conn?.open && state.connAuthenticated) {
+      conn.close();
+      return;
+    }
+
+    state.conn?.close?.();
     state.conn = conn;
     attachReceiver(conn);
   });
 
   peer.on("error", (error) => {
+    if (state.peer !== peer || state.isClosing) return;
+
     if (error?.type === "unavailable-id" && !state.isClosing) {
       const delay = Math.min(800 + retryCount * 350, 3500);
       setPill("再接続準備中", "warn");
@@ -168,17 +216,56 @@ function createDesktopPeer(peerId, retryCount = 0) {
 
     setPill("接続エラー", "error");
     els.desktopStatus.textContent = formatPeerError(error);
+    els.refreshQr.disabled = false;
   });
 }
 
-function startPhone(targetPeerId) {
+function refreshDesktopSession() {
+  if (els.desktopView.hidden || state.isClosing) return;
+
+  const peerId = createPeerId();
+  const sessionSecret = createSessionSecret();
+  setDesktopQrBusy("暗号鍵を準備中");
+  window.clearTimeout(state.desktopRetryTimer);
+  state.conn?.close?.();
+  state.peer?.destroy?.();
+  state.conn = null;
+  state.connAuthenticated = false;
+  state.incomingTransfers.clear();
+  state.sessionSecret = sessionSecret;
+  void deriveSessionKeys(sessionSecret).then((sessionKeys) => {
+    if (state.sessionSecret !== sessionSecret || state.isClosing) return;
+
+    state.sessionKeys = sessionKeys;
+    ensureDesktopUrlHasRoom(peerId);
+    createDesktopPeer(peerId);
+  }).catch(() => {
+    setPill("暗号化エラー", "error");
+    els.desktopStatus.textContent = "暗号鍵を準備できませんでした。ページを再読み込みしてください。";
+    els.refreshQr.disabled = false;
+  });
+  setPill("再発行中", "warn");
+  els.desktopStatus.textContent = "新しいQRコードを発行しています";
+}
+
+async function startPhone(targetPeerId, sessionSecret) {
   els.viewTitle.textContent = "WebRTCでファイルを送信";
   setPill("接続中", "warn");
   els.desktopView.hidden = true;
   els.phoneView.hidden = false;
   els.unsupportedView.hidden = true;
   setPhoneReady(false);
+
+  if (!isValidSessionSecret(sessionSecret)) {
+    setPill("QRエラー", "error");
+    els.phoneStatus.textContent = "QRコードに秘密鍵が含まれていません。PC側でQRコードを再発行して読み取り直してください。";
+    return;
+  }
+
   state.targetPeerId = targetPeerId;
+  state.sessionSecret = sessionSecret;
+  state.sessionKeys = await deriveSessionKeys(sessionSecret);
+  state.phoneAuthFailed = false;
 
   const peer = createPeer();
   state.peer = peer;
@@ -203,7 +290,7 @@ function startPhone(targetPeerId) {
 }
 
 function connectToDesktop() {
-  if (!state.peer?.open || !state.targetPeerId || state.isClosing) return;
+  if (!state.peer?.open || !state.targetPeerId || !state.sessionKeys || state.isClosing) return;
 
   window.clearTimeout(state.phoneReconnectTimer);
   state.phoneReconnectTimer = null;
@@ -216,9 +303,11 @@ function connectToDesktop() {
 
   const conn = state.peer.connect(state.targetPeerId, {
     reliable: true,
-    metadata: { role: "phone" },
+    metadata: { role: "phone", secureProtocol: SECURE_PROTOCOL_VERSION },
   });
   state.conn = conn;
+  state.connAuthenticated = false;
+  state.phoneAuthFailed = false;
   attachSender(conn);
 }
 
@@ -244,11 +333,12 @@ function schedulePhoneReconnect() {
   }, delay);
 }
 
-function buildPhoneUrl(peerId) {
+function buildPhoneUrl(peerId, sessionSecret) {
   const url = new URL(window.location.href);
   url.search = "";
   url.hash = "";
   url.searchParams.set("peer", peerId);
+  url.hash = new URLSearchParams({ key: sessionSecret }).toString();
   return url.toString();
 }
 
@@ -257,24 +347,7 @@ function formatPhoneUrlLabel(urlText) {
   const peer = url.searchParams.get("peer") || "";
   const shortPeer = peer.length > 24 ? `${peer.slice(0, 18)}...${peer.slice(-6)}` : peer;
 
-  return `${url.host}${url.pathname}?peer=${shortPeer}`;
-}
-
-function getDesktopPeerId() {
-  const params = new URLSearchParams(window.location.search);
-  const roomId = params.get("room");
-
-  if (roomId) {
-    writeStoredPeerId(roomId);
-    return roomId;
-  }
-
-  const storedId = readStoredPeerId();
-  if (storedId) return storedId;
-
-  const nextId = createPeerId();
-  writeStoredPeerId(nextId);
-  return nextId;
+  return `${url.host}${url.pathname}?peer=${shortPeer}#key=...`;
 }
 
 function ensureDesktopUrlHasRoom(peerId) {
@@ -287,39 +360,120 @@ function ensureDesktopUrlHasRoom(peerId) {
   window.history.replaceState(null, "", url);
 }
 
-function readStoredPeerId() {
-  try {
-    return window.localStorage.getItem(DESKTOP_PEER_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function writeStoredPeerId(peerId) {
-  try {
-    window.localStorage.setItem(DESKTOP_PEER_STORAGE_KEY, peerId);
-  } catch {
-    // localStorageが使えない場合も、URLのroomパラメータで同じIDを維持する。
-  }
-}
-
 function createPeerId() {
   const bytes = new Uint8Array(12);
-
-  if (window.crypto?.getRandomValues) {
-    window.crypto.getRandomValues(bytes);
-  } else {
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = Math.floor(Math.random() * 256);
-    }
-  }
+  window.crypto.getRandomValues(bytes);
 
   return `qr-transfer-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function createSessionSecret() {
+  return bytesToBase64Url(createRandomBytes(SESSION_SECRET_BYTES));
+}
+
+function createAuthNonce() {
+  return bytesToBase64Url(createRandomBytes(AUTH_NONCE_BYTES));
+}
+
+function createRandomBytes(length) {
+  const bytes = new Uint8Array(length);
+  window.crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function readSessionSecretFromHash() {
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  return new URLSearchParams(hash).get("key") || "";
+}
+
+function isValidSessionSecret(secret) {
+  try {
+    return base64UrlToBytes(secret).byteLength === SESSION_SECRET_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+function isSecureCryptoSupported() {
+  return Boolean(window.crypto?.getRandomValues && window.crypto?.subtle && window.TextEncoder && window.TextDecoder);
+}
+
+async function deriveSessionKeys(sessionSecret) {
+  const secretBytes = base64UrlToBytes(sessionSecret);
+  const baseKey = await window.crypto.subtle.importKey("raw", secretBytes, "HKDF", false, ["deriveKey"]);
+  const salt = encodeText("qr-transfer-v1");
+
+  const authKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt,
+      info: encodeText("auth"),
+    },
+    baseKey,
+    {
+      name: "HMAC",
+      hash: "SHA-256",
+      length: 256,
+    },
+    false,
+    ["sign", "verify"],
+  );
+
+  const encryptionKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt,
+      info: encodeText("file-encryption"),
+    },
+    baseKey,
+    {
+      name: "AES-GCM",
+      length: 256,
+    },
+    false,
+    ["encrypt", "decrypt"],
+  );
+
+  return { authKey, encryptionKey };
+}
+
+function encodeText(text) {
+  return new TextEncoder().encode(text);
+}
+
+function decodeText(bytes) {
+  return new TextDecoder().decode(bytes);
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToBytes(text) {
+  if (typeof text !== "string" || !/^[A-Za-z0-9_-]+$/.test(text)) {
+    throw new Error("Invalid base64url text");
+  }
+
+  const base64 = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function renderQr(url) {
   if (!window.QRCode) {
     els.qrLoading.textContent = "QRコードを生成できません。下のリンクをスマートフォンで開いてください。";
+    els.refreshQr.disabled = false;
     return;
   }
 
@@ -332,25 +486,61 @@ function renderQr(url) {
     colorLight: "#ffffff",
     correctLevel: QRCode.CorrectLevel?.M ?? 0,
   });
+  els.qrCode.removeAttribute("title");
   els.qrLoading.hidden = true;
+  els.refreshQr.disabled = false;
+}
+
+function setDesktopQrBusy(message) {
+  els.refreshQr.disabled = true;
+  els.phoneLink.removeAttribute("href");
+  els.phoneLink.textContent = "スマートフォン用リンクを準備中";
+  els.phoneLink.title = "";
+  els.qrCode.replaceChildren();
+  els.qrLoading.textContent = message;
+  els.qrLoading.hidden = false;
 }
 
 function attachReceiver(conn) {
-  setPill("接続済み", "success");
-  els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+  state.connAuthenticated = false;
+  state.receiverQueue = Promise.resolve();
+  setPill("認証中", "warn");
+  els.desktopStatus.textContent = "スマートフォンとの接続を確認しています";
 
   conn.on("open", () => {
-    setPill("接続済み", "success");
+    if (state.conn !== conn || state.isClosing) return;
+
+    setPill("認証中", "warn");
   });
 
-  conn.on("data", handleIncomingData);
+  conn.on("data", (data) => {
+    if (state.conn !== conn || state.isClosing) return;
+
+    state.receiverQueue = state.receiverQueue
+      .then(() => handleIncomingData(data, conn))
+      .catch(() => {
+        if (state.conn !== conn || state.isClosing) return;
+
+        setPill("受信エラー", "error");
+        els.desktopStatus.textContent = "受信データを復号できませんでした。QRコードを再発行してください。";
+        state.conn = null;
+        state.connAuthenticated = false;
+        conn.close();
+      });
+  });
 
   conn.on("close", () => {
+    if (state.conn !== conn || state.isClosing) return;
+
+    state.connAuthenticated = false;
     setPill("切断", "warn");
     els.desktopStatus.textContent = "スマートフォンからの再接続を待っています";
   });
 
   conn.on("error", () => {
+    if (state.conn !== conn || state.isClosing) return;
+
+    state.connAuthenticated = false;
     setPill("受信エラー", "error");
     els.desktopStatus.textContent = "受信中にエラーが発生しました。接続をやり直してください。";
   });
@@ -361,13 +551,24 @@ function attachSender(conn) {
     if (state.conn !== conn) return;
 
     state.phoneReconnectAttempts = 0;
-    setPill("接続済み", "success");
-    setPhoneReady(true);
-    els.phoneStatus.textContent = "送信するファイルを選択してください";
+    state.connAuthenticated = false;
+    setPill("認証中", "warn");
+    setPhoneReady(false);
+    els.phoneStatus.textContent = "PCとの接続を確認しています";
+    void sendAuthHello(conn);
+  });
+
+  conn.on("data", (data) => {
+    if (state.conn !== conn || state.isClosing) return;
+
+    void handleSenderData(data, conn);
   });
 
   conn.on("close", () => {
     if (state.conn !== conn || state.isClosing) return;
+
+    state.connAuthenticated = false;
+    if (state.phoneAuthFailed) return;
 
     setPill("再接続中", "warn");
     setPhoneReady(false);
@@ -378,6 +579,9 @@ function attachSender(conn) {
   conn.on("error", () => {
     if (state.conn !== conn || state.isClosing) return;
 
+    state.connAuthenticated = false;
+    if (state.phoneAuthFailed) return;
+
     setPill("再接続中", "warn");
     setPhoneReady(false);
     els.phoneStatus.textContent = "PCへ再接続しています";
@@ -385,26 +589,339 @@ function attachSender(conn) {
   });
 }
 
-function handleIncomingData(data) {
+async function sendAuthHello(conn) {
+  try {
+    const nonce = createAuthNonce();
+    state.authNonce = nonce;
+    const token = await signAuthMessage(createAuthMessage("phone", nonce));
+
+    if (state.conn !== conn || !conn.open || state.isClosing) return;
+
+    conn.send({
+      type: "auth-hello",
+      version: SECURE_PROTOCOL_VERSION,
+      nonce,
+      token,
+    });
+  } catch {
+    if (state.conn !== conn || state.isClosing) return;
+
+    state.phoneAuthFailed = true;
+    setPill("認証エラー", "error");
+    setPhoneReady(false);
+    els.phoneStatus.textContent = "接続認証を開始できませんでした。QRコードを読み取り直してください。";
+    conn.close();
+  }
+}
+
+async function handleAuthHello(data, conn) {
+  if (
+    data.version !== SECURE_PROTOCOL_VERSION ||
+    typeof data.nonce !== "string" ||
+    typeof data.token !== "string"
+  ) {
+    rejectUnauthenticatedConnection(conn);
+    return;
+  }
+
+  const isValid = await verifyAuthMessage(createAuthMessage("phone", data.nonce), data.token);
+  if (!isValid) {
+    rejectUnauthenticatedConnection(conn);
+    return;
+  }
+
+  const token = await signAuthMessage(createAuthMessage("desktop", data.nonce));
+  if (state.conn !== conn || !conn.open || state.isClosing) return;
+
+  state.connAuthenticated = true;
+  setPill("接続済み", "success");
+  els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+  conn.send({
+    type: "auth-ok",
+    version: SECURE_PROTOCOL_VERSION,
+    nonce: data.nonce,
+    token,
+  });
+}
+
+async function handleSenderData(data, conn) {
   if (!data || typeof data !== "object") return;
 
+  if (data.type === "auth-error") {
+    state.connAuthenticated = false;
+    state.phoneAuthFailed = true;
+    setPill("認証エラー", "error");
+    setPhoneReady(false);
+    els.phoneStatus.textContent = "PCとの接続認証に失敗しました。QRコードを読み取り直してください。";
+    conn.close();
+    return;
+  }
+
+  if (data.type !== "auth-ok") return;
+
+  if (
+    data.version !== SECURE_PROTOCOL_VERSION ||
+    data.nonce !== state.authNonce ||
+    typeof data.token !== "string"
+  ) {
+    state.connAuthenticated = false;
+    state.phoneAuthFailed = true;
+    setPill("認証エラー", "error");
+    setPhoneReady(false);
+    els.phoneStatus.textContent = "PCからの認証応答を確認できませんでした。QRコードを読み取り直してください。";
+    conn.close();
+    return;
+  }
+
+  const isValid = await verifyAuthMessage(createAuthMessage("desktop", data.nonce), data.token);
+  if (state.conn !== conn || state.isClosing) return;
+
+  if (!isValid) {
+    state.connAuthenticated = false;
+    state.phoneAuthFailed = true;
+    setPill("認証エラー", "error");
+    setPhoneReady(false);
+    els.phoneStatus.textContent = "PCとの接続認証に失敗しました。QRコードを読み取り直してください。";
+    conn.close();
+    return;
+  }
+
+  state.connAuthenticated = true;
+  state.phoneAuthFailed = false;
+  state.authNonce = null;
+  setPill("接続済み", "success");
+  setPhoneReady(isConnectionReady());
+  els.phoneStatus.textContent = "暗号化接続を確認しました。送信するファイルを選択してください";
+}
+
+function rejectUnauthenticatedConnection(conn) {
+  if (state.conn === conn && !state.isClosing) {
+    state.connAuthenticated = false;
+    setPill("認証エラー", "error");
+    els.desktopStatus.textContent = "接続認証に失敗しました。QRコードを再発行してください。";
+    state.conn = null;
+  }
+
+  if (conn.open) {
+    conn.send({ type: "auth-error", version: SECURE_PROTOCOL_VERSION });
+    conn.close();
+  }
+}
+
+function createAuthMessage(role, nonce) {
+  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|auth|${role}|${nonce}`;
+}
+
+async function signAuthMessage(message) {
+  const signature = await window.crypto.subtle.sign("HMAC", state.sessionKeys.authKey, encodeText(message));
+  return bytesToBase64Url(new Uint8Array(signature));
+}
+
+async function verifyAuthMessage(message, token) {
+  try {
+    return await window.crypto.subtle.verify(
+      "HMAC",
+      state.sessionKeys.authKey,
+      base64UrlToBytes(token),
+      encodeText(message),
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function encryptFileMeta(meta) {
+  return {
+    type: "file-meta",
+    id: meta.id,
+    encrypted: true,
+    payload: await encryptJsonPayload(meta, createFileMetaAad(meta.id)),
+  };
+}
+
+async function decryptFileMeta(data) {
+  if (data.encrypted !== true || typeof data.id !== "string") {
+    throw new Error("Unencrypted file metadata is not accepted");
+  }
+
+  const meta = await decryptJsonPayload(data.payload, createFileMetaAad(data.id));
+  return normalizeFileMeta(meta, data.id);
+}
+
+async function encryptFileChunk({ id, index, byteLength, chunk }) {
+  return {
+    type: "file-chunk",
+    id,
+    index,
+    byteLength,
+    encrypted: true,
+    payload: await encryptBinaryPayload(chunk, createFileChunkAad(id, index, byteLength)),
+  };
+}
+
+async function decryptFileChunk(data) {
+  if (
+    data.encrypted !== true ||
+    typeof data.id !== "string" ||
+    !Number.isSafeInteger(data.index) ||
+    !Number.isSafeInteger(data.byteLength) ||
+    data.index < 0 ||
+    data.byteLength < 0 ||
+    data.byteLength > TRANSFER_CHUNK_SIZE
+  ) {
+    throw new Error("Invalid encrypted file chunk");
+  }
+
+  const chunk = await decryptBinaryPayload(data.payload, createFileChunkAad(data.id, data.index, data.byteLength));
+  if (chunk.byteLength !== data.byteLength) {
+    throw new Error("Decrypted chunk size mismatch");
+  }
+  return chunk;
+}
+
+async function encryptJsonPayload(value, additionalData) {
+  return encryptBinaryPayload(encodeText(JSON.stringify(value)), additionalData);
+}
+
+async function decryptJsonPayload(payload, additionalData) {
+  const buffer = await decryptBinaryPayload(payload, additionalData);
+  return JSON.parse(decodeText(new Uint8Array(buffer)));
+}
+
+async function encryptBinaryPayload(value, additionalData) {
+  const iv = createRandomBytes(AES_GCM_IV_BYTES);
+  const data = toArrayBuffer(value);
+  const ciphertext = await window.crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: encodeText(additionalData),
+    },
+    state.sessionKeys.encryptionKey,
+    data,
+  );
+
+  return {
+    iv: iv.buffer,
+    data: ciphertext,
+  };
+}
+
+async function decryptBinaryPayload(payload, additionalData) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Missing encrypted payload");
+  }
+
+  const iv = toUint8Array(payload.iv);
+  if (iv.byteLength !== AES_GCM_IV_BYTES) {
+    throw new Error("Invalid AES-GCM IV length");
+  }
+
+  return window.crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: encodeText(additionalData),
+    },
+    state.sessionKeys.encryptionKey,
+    toArrayBuffer(payload.data),
+  );
+}
+
+function normalizeFileMeta(meta, id) {
+  if (!meta || typeof meta !== "object") {
+    throw new Error("Invalid file metadata");
+  }
+
+  const totalChunks = meta.totalChunks;
+  const size = meta.size;
+  const expectedTotalChunks = Math.max(1, Math.ceil(size / TRANSFER_CHUNK_SIZE));
+  if (
+    meta.id !== id ||
+    typeof meta.name !== "string" ||
+    meta.name.length < 1 ||
+    meta.name.length > MAX_FILE_NAME_LENGTH ||
+    typeof meta.mime !== "string" ||
+    meta.mime.length > MAX_MIME_LENGTH ||
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    !Number.isSafeInteger(totalChunks) ||
+    totalChunks < 1 ||
+    totalChunks > MAX_TRANSFER_CHUNKS ||
+    totalChunks !== expectedTotalChunks
+  ) {
+    throw new Error("Invalid file metadata");
+  }
+
+  return {
+    id,
+    name: meta.name,
+    mime: meta.mime,
+    size,
+    totalChunks,
+  };
+}
+
+function createFileMetaAad(id) {
+  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|file-meta|${id}`;
+}
+
+function createFileChunkAad(id, index, byteLength) {
+  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|file-chunk|${id}|${index}|${byteLength}`;
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+  throw new Error("Expected binary data");
+}
+
+function toArrayBuffer(value) {
+  const bytes = toUint8Array(value);
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+
+  return bytes.slice().buffer;
+}
+
+async function handleIncomingData(data, conn) {
+  if (!data || typeof data !== "object") return;
+
+  if (data.type === "auth-hello") {
+    await handleAuthHello(data, conn);
+    return;
+  }
+
+  if (!state.connAuthenticated) {
+    rejectUnauthenticatedConnection(conn);
+    return;
+  }
+
   if (data.type === "file-meta") {
-    state.incomingTransfers.set(data.id, {
-      meta: data,
-      chunks: new Array(data.totalChunks),
+    const meta = await decryptFileMeta(data);
+    state.incomingTransfers.set(meta.id, {
+      meta,
+      chunks: new Array(meta.totalChunks),
       receivedBytes: 0,
       receivedChunks: 0,
-      element: createReceivingItem(data),
+      element: createReceivingItem(meta),
     });
-    els.desktopStatus.textContent = `${data.name} を受信しています`;
+    els.desktopStatus.textContent = `${meta.name} を受信しています`;
     return;
   }
 
   if (data.type === "file-chunk") {
     const transfer = state.incomingTransfers.get(data.id);
-    if (!transfer || transfer.chunks[data.index]) return;
+    if (!transfer) return;
+    if (!isValidChunkEnvelope(data, transfer.meta) || transfer.chunks[data.index]) {
+      throw new Error("Invalid file chunk");
+    }
 
-    transfer.chunks[data.index] = data.chunk;
+    const chunk = await decryptFileChunk(data);
+    transfer.chunks[data.index] = chunk;
     transfer.receivedChunks += 1;
     transfer.receivedBytes += data.byteLength;
     updateReceivingItem(transfer);
@@ -413,6 +930,23 @@ function handleIncomingData(data) {
       completeReceivingItem(data.id, transfer);
     }
   }
+}
+
+function isValidChunkEnvelope(data, meta) {
+  if (
+    !Number.isSafeInteger(data.index) ||
+    data.index < 0 ||
+    data.index >= meta.totalChunks ||
+    !Number.isSafeInteger(data.byteLength) ||
+    data.byteLength < 0 ||
+    data.byteLength > TRANSFER_CHUNK_SIZE
+  ) {
+    return false;
+  }
+
+  const expectedLength =
+    data.index === meta.totalChunks - 1 ? meta.size - data.index * TRANSFER_CHUNK_SIZE : TRANSFER_CHUNK_SIZE;
+  return data.byteLength === expectedLength;
 }
 
 function createReceivingItem(meta) {
@@ -665,12 +1199,12 @@ async function openAppCamera() {
       stopAppCameraStream();
       els.appCameraPanel.hidden = true;
       els.phoneStatus.textContent = "アプリ内カメラを起動できませんでした。カメラを起動する方法を試してください。";
-      setPhoneReady(Boolean(state.conn?.open));
+      setPhoneReady(isConnectionReady());
     }
   } finally {
     if (requestId === state.appCameraRequestId) {
       state.isOpeningAppCamera = false;
-      setPhoneReady(Boolean(state.conn?.open));
+      setPhoneReady(isConnectionReady());
     }
   }
 }
@@ -762,7 +1296,7 @@ async function captureAppCamera() {
     canvas.height = 0;
     stopAppCameraStream();
     els.phoneStatus.textContent = "撮影画像を作成できませんでした。";
-    setPhoneReady(Boolean(state.conn?.open));
+    setPhoneReady(isConnectionReady());
     return;
   }
 
@@ -779,12 +1313,12 @@ async function captureAppCamera() {
     els.phoneStatus.textContent = "撮影した写真を確認してください";
   } catch {
     els.phoneStatus.textContent = "撮影画像を作成できませんでした。もう一度撮影してください。";
-    setPhoneReady(Boolean(state.conn?.open));
+    setPhoneReady(isConnectionReady());
   } finally {
     state.isCapturingAppCamera = false;
     canvas.width = 0;
     canvas.height = 0;
-    setPhoneReady(Boolean(state.conn?.open));
+    setPhoneReady(isConnectionReady());
   }
 }
 
@@ -949,7 +1483,7 @@ async function showSelectedFilePreview(file, source) {
     renderPreviewMessage(els.fileReviewContent, skipPreviewMessage);
   }
   els.phoneStatus.textContent = "送信するファイルを確認してください";
-  setPhoneReady(Boolean(state.conn?.open));
+  setPhoneReady(isConnectionReady());
 }
 
 async function getSelectedFilePreviewSkipMessage(file, source) {
@@ -1122,6 +1656,7 @@ function formatSelectedFileDetail(file) {
 
 function clearObsoleteStorage() {
   try {
+    window.localStorage?.removeItem(OBSOLETE_DESKTOP_PEER_STORAGE_KEY);
     window.localStorage?.removeItem("qr-transfer-debug-log");
   } catch {
     // Ignore storage cleanup failures.
@@ -1175,13 +1710,13 @@ function clearPendingFile() {
   els.chooseAnotherFile.textContent = "選び直す";
   els.fileReviewContent.replaceChildren();
   els.fileReviewContent.dataset.previewKind = "empty";
-  setPhoneReady(Boolean(state.conn?.open));
+  setPhoneReady(isConnectionReady());
 }
 
 function closeAppCamera() {
   stopAppCameraStream();
   els.phoneStatus.textContent = "送信するファイルを選択してください";
-  setPhoneReady(Boolean(state.conn?.open));
+  setPhoneReady(isConnectionReady());
 }
 
 function stopAppCameraStream() {
@@ -1203,7 +1738,14 @@ function stopMediaStream(stream) {
 
 async function sendFile(file) {
   const conn = state.conn;
-  if (!conn?.open || state.isSending) return false;
+  if (!conn?.open || !state.connAuthenticated || state.isSending) return false;
+
+  const totalChunks = Math.max(1, Math.ceil(file.size / TRANSFER_CHUNK_SIZE));
+  if (!canSendFile(file, totalChunks)) {
+    setPill("送信不可", "error");
+    els.phoneStatus.textContent = "このファイルは送信できません。ファイル名またはサイズを確認してください。";
+    return false;
+  }
 
   state.isSending = true;
   setPhoneReady(false);
@@ -1212,36 +1754,35 @@ async function sendFile(file) {
   els.sendProgress.value = 0;
   els.phoneStatus.textContent = `${file.name} を送信しています`;
 
-  const id = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const totalChunks = Math.max(1, Math.ceil(file.size / TRANSFER_CHUNK_SIZE));
+  const id = window.crypto.randomUUID?.() || `transfer-${bytesToBase64Url(createRandomBytes(16))}`;
 
-  conn.send({
-    type: "file-meta",
-    id,
+  const meta = {
     name: file.name,
     mime: file.type,
     size: file.size,
     totalChunks,
-  });
+    id,
+  };
 
   let didSend = false;
 
   try {
+    conn.send(await encryptFileMeta(meta));
+
     for (let index = 0; index < totalChunks; index += 1) {
       await waitForBuffer(conn);
-      if (!conn.open) throw new Error("Data connection closed");
+      if (!conn.open || !state.connAuthenticated) throw new Error("Data connection closed");
 
       const start = index * TRANSFER_CHUNK_SIZE;
       const end = Math.min(file.size, start + TRANSFER_CHUNK_SIZE);
       const chunk = await file.slice(start, end).arrayBuffer();
 
-      conn.send({
-        type: "file-chunk",
+      conn.send(await encryptFileChunk({
         id,
         index,
         byteLength: chunk.byteLength,
         chunk,
-      });
+      }));
 
       els.sendProgress.value = Math.floor(((index + 1) / totalChunks) * 100);
     }
@@ -1254,11 +1795,26 @@ async function sendFile(file) {
     els.phoneStatus.textContent = "送信中にエラーが発生しました。接続を確認してやり直してください。";
   } finally {
     state.isSending = false;
-    setPhoneReady(Boolean(state.conn?.open));
+    setPhoneReady(isConnectionReady());
     els.sendProgress.hidden = true;
   }
 
   return didSend;
+}
+
+function canSendFile(file, totalChunks) {
+  return (
+    typeof file.name === "string" &&
+    file.name.length >= 1 &&
+    file.name.length <= MAX_FILE_NAME_LENGTH &&
+    typeof file.type === "string" &&
+    file.type.length <= MAX_MIME_LENGTH &&
+    Number.isSafeInteger(file.size) &&
+    file.size >= 0 &&
+    Number.isSafeInteger(totalChunks) &&
+    totalChunks >= 1 &&
+    totalChunks <= MAX_TRANSFER_CHUNKS
+  );
 }
 
 function waitForBuffer(conn) {
@@ -1294,6 +1850,10 @@ function cleanup() {
   }
   state.conn?.close?.();
   state.peer?.destroy?.();
+}
+
+function isConnectionReady() {
+  return Boolean(state.conn?.open && state.connAuthenticated);
 }
 
 function setPhoneReady(isReady) {

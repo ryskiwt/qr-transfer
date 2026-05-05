@@ -208,6 +208,17 @@ h2 {
   text-decoration: underline;
 }
 
+.qr-actions {
+  width: min(100%, 320px);
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+}
+
+.qr-actions .secondary-button {
+  width: 100%;
+}
+
 .preview-area {
   min-width: 0;
   display: grid;
