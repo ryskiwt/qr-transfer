@@ -694,7 +694,7 @@ function waitForVideoReady(video) {
 
 function updateAppCameraDetail() {
   els.appCameraDetail.textContent =
-    `撮影後は長辺${APP_CAMERA_MAX_LONG_EDGE}px、短辺${APP_CAMERA_MAX_SHORT_EDGE}px以内で保存します`;
+    `撮影後は長辺${APP_CAMERA_MAX_LONG_EDGE}px、短辺${APP_CAMERA_MAX_SHORT_EDGE}px以内で保存し、横向き時は向きを補正します`;
 }
 
 async function captureAppCamera() {
@@ -706,9 +706,9 @@ async function captureAppCamera() {
   els.phoneStatus.textContent = "撮影した写真を作成しています";
 
   const canvas = document.createElement("canvas");
-  const size = calculateBoundedImageSize(video.videoWidth, video.videoHeight);
-  canvas.width = size.width;
-  canvas.height = size.height;
+  const capture = getAppCameraCapture(video);
+  canvas.width = capture.width;
+  canvas.height = capture.height;
 
   const context = canvas.getContext("2d", { alpha: false });
   if (!context) {
@@ -721,7 +721,7 @@ async function captureAppCamera() {
     return;
   }
 
-  context.drawImage(video, 0, 0, size.width, size.height);
+  drawAppCameraFrame(context, video, capture);
 
   try {
     const blob = await canvasToBlob(canvas, "image/jpeg", APP_CAMERA_JPEG_QUALITY);
@@ -753,6 +753,64 @@ function calculateBoundedImageSize(width, height) {
     width: Math.max(1, Math.round(width * scale)),
     height: Math.max(1, Math.round(height * scale)),
   };
+}
+
+function getAppCameraCapture(video) {
+  const rotation = getAppCameraRotation(video);
+  const isSideways = Math.abs(rotation) === 90;
+  const outputWidth = isSideways ? video.videoHeight : video.videoWidth;
+  const outputHeight = isSideways ? video.videoWidth : video.videoHeight;
+
+  return {
+    ...calculateBoundedImageSize(outputWidth, outputHeight),
+    rotation,
+  };
+}
+
+function getAppCameraRotation(video) {
+  if (!isLandscapeOrientation() || video.videoWidth >= video.videoHeight) return 0;
+
+  if (screen.orientation?.type === "landscape-secondary") return -90;
+
+  const angle = getOrientationAngle();
+  if (angle === -90 || angle === 270) return -90;
+
+  return 90;
+}
+
+function isLandscapeOrientation() {
+  const type = screen.orientation?.type || "";
+  if (type.startsWith("landscape")) return true;
+
+  const angle = getOrientationAngle();
+  if (Math.abs(angle) === 90 || Math.abs(angle) === 270) return true;
+
+  return window.matchMedia?.("(orientation: landscape)")?.matches || window.innerWidth > window.innerHeight;
+}
+
+function getOrientationAngle() {
+  if (typeof screen.orientation?.angle === "number") return screen.orientation.angle;
+  if (typeof window.orientation === "number") return window.orientation;
+
+  return 0;
+}
+
+function drawAppCameraFrame(context, video, capture) {
+  if (capture.rotation === 90) {
+    context.translate(capture.width, 0);
+    context.rotate(Math.PI / 2);
+    context.drawImage(video, 0, 0, capture.height, capture.width);
+    return;
+  }
+
+  if (capture.rotation === -90) {
+    context.translate(0, capture.height);
+    context.rotate(-Math.PI / 2);
+    context.drawImage(video, 0, 0, capture.height, capture.width);
+    return;
+  }
+
+  context.drawImage(video, 0, 0, capture.width, capture.height);
 }
 
 function canvasToBlob(canvas, type, quality) {
