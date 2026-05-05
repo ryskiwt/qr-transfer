@@ -8,6 +8,8 @@ const APP_CAMERA_MAX_LONG_EDGE = 1920;
 const APP_CAMERA_MAX_SHORT_EDGE = 1440;
 const APP_CAMERA_JPEG_QUALITY = 0.88;
 const APP_CAMERA_READY_TIMEOUT_MS = 8000;
+const FILE_IMAGE_PREVIEW_MAX_PIXELS = 8 * 1000 * 1000;
+const IMAGE_HEADER_READ_BYTES = 512 * 1024;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -621,7 +623,6 @@ async function openAppCamera() {
     return;
   }
 
-  stopAppCameraStream();
   const requestId = state.appCameraRequestId + 1;
   state.appCameraRequestId = requestId;
   state.isOpeningAppCamera = true;
@@ -766,7 +767,6 @@ async function captureAppCamera() {
       lastModified: Date.now(),
     });
 
-    stopAppCameraStream();
     await showSelectedFilePreview(file, "app-camera");
     els.phoneStatus.textContent = "撮影した写真を確認してください";
   } catch {
@@ -918,7 +918,8 @@ function createCameraFileName() {
 async function showSelectedFilePreview(file, source) {
   clearPendingFile();
 
-  const url = createObjectUrl(file);
+  const skipPreviewMessage = await getSelectedFilePreviewSkipMessage(file, source);
+  const url = skipPreviewMessage ? null : createObjectUrl(file);
   state.pendingFile = file;
   state.pendingSource = source;
   state.pendingFileUrl = url;
@@ -927,20 +928,191 @@ async function showSelectedFilePreview(file, source) {
   els.fileReviewName.textContent = file.name;
   els.fileReviewDetail.textContent = formatSelectedFileDetail(file);
   els.chooseAnotherFile.textContent = source === "app-camera" ? "撮り直す" : "選び直す";
-  await renderFilePreview(els.fileReviewContent, {
-    blob: file,
-    meta: {
-      name: file.name,
-      mime: file.type,
-    },
-    url,
-  });
+  if (url) {
+    await renderFilePreview(els.fileReviewContent, {
+      blob: file,
+      meta: {
+        name: file.name,
+        mime: file.type,
+      },
+      url,
+    });
+  } else {
+    renderPreviewMessage(els.fileReviewContent, skipPreviewMessage);
+  }
   els.phoneStatus.textContent = "送信するファイルを確認してください";
   setPhoneReady(Boolean(state.conn?.open));
 }
 
+async function getSelectedFilePreviewSkipMessage(file, source) {
+  if (source !== "file" || !isImageFile(file)) return "";
+
+  const dimensions = await readImageDimensions(file).catch(() => null);
+  if (!dimensions) return "";
+
+  const pixels = dimensions.width * dimensions.height;
+  if (pixels <= FILE_IMAGE_PREVIEW_MAX_PIXELS) return "";
+
+  return `画像が大きいためスマートフォン側プレビューを省略します。${dimensions.width} x ${dimensions.height}px / ${formatBytes(file.size)}`;
+}
+
+async function readImageDimensions(file) {
+  if (isJpegFile(file)) return readJpegDimensions(file);
+  if (isPngFile(file)) return readPngDimensions(file);
+  if (isGifFile(file)) return readGifDimensions(file);
+  if (isWebpFile(file)) return readWebpDimensions(file);
+
+  return null;
+}
+
+function isImageFile(file) {
+  return file.type.startsWith("image/") || /\.(jpe?g|png|gif|webp)$/i.test(file.name);
+}
+
+async function readJpegDimensions(file) {
+  const buffer = await file.slice(0, Math.min(file.size, IMAGE_HEADER_READ_BYTES)).arrayBuffer();
+  const view = new DataView(buffer);
+  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null;
+
+  let offset = 2;
+  while (offset + 9 <= view.byteLength) {
+    if (view.getUint8(offset) !== 0xff) return null;
+
+    const marker = view.getUint8(offset + 1);
+    if (marker === 0xda || marker === 0xd9) return null;
+
+    const length = view.getUint16(offset + 2);
+    if (length < 2 || offset + 2 + length > view.byteLength) return null;
+
+    if (isJpegStartOfFrame(marker)) {
+      return {
+        width: view.getUint16(offset + 7),
+        height: view.getUint16(offset + 5),
+      };
+    }
+
+    offset += 2 + length;
+  }
+
+  return null;
+}
+
+async function readPngDimensions(file) {
+  const view = await readFileHeader(file, 24);
+  if (view.byteLength < 24 || view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
+    return null;
+  }
+
+  return {
+    width: view.getUint32(16),
+    height: view.getUint32(20),
+  };
+}
+
+async function readGifDimensions(file) {
+  const view = await readFileHeader(file, 10);
+  if (view.byteLength < 10) return null;
+
+  const signature = readHeaderAscii(view, 0, 6);
+  if (signature !== "GIF87a" && signature !== "GIF89a") return null;
+
+  return {
+    width: view.getUint16(6, true),
+    height: view.getUint16(8, true),
+  };
+}
+
+async function readWebpDimensions(file) {
+  const view = await readFileHeader(file, 64);
+  if (view.byteLength < 30 || readHeaderAscii(view, 0, 4) !== "RIFF" || readHeaderAscii(view, 8, 4) !== "WEBP") {
+    return null;
+  }
+
+  const chunkType = readHeaderAscii(view, 12, 4);
+  if (chunkType === "VP8X") {
+    return {
+      width: readUint24LE(view, 24) + 1,
+      height: readUint24LE(view, 27) + 1,
+    };
+  }
+
+  if (chunkType === "VP8 " && view.byteLength >= 30) {
+    return {
+      width: view.getUint16(26, true) & 0x3fff,
+      height: view.getUint16(28, true) & 0x3fff,
+    };
+  }
+
+  if (chunkType === "VP8L" && view.byteLength >= 25 && view.getUint8(20) === 0x2f) {
+    const b0 = view.getUint8(21);
+    const b1 = view.getUint8(22);
+    const b2 = view.getUint8(23);
+    const b3 = view.getUint8(24);
+
+    return {
+      width: 1 + (b0 | ((b1 & 0x3f) << 8)),
+      height: 1 + (((b1 & 0xc0) >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10)),
+    };
+  }
+
+  return null;
+}
+
+async function readFileHeader(file, bytes) {
+  return new DataView(await file.slice(0, Math.min(file.size, bytes)).arrayBuffer());
+}
+
+function isJpegFile(file) {
+  return file.type === "image/jpeg" || /\.jpe?g$/i.test(file.name);
+}
+
+function isPngFile(file) {
+  return file.type === "image/png" || /\.png$/i.test(file.name);
+}
+
+function isGifFile(file) {
+  return file.type === "image/gif" || /\.gif$/i.test(file.name);
+}
+
+function isWebpFile(file) {
+  return file.type === "image/webp" || /\.webp$/i.test(file.name);
+}
+
+function isJpegStartOfFrame(marker) {
+  return (
+    (marker >= 0xc0 && marker <= 0xc3) ||
+    (marker >= 0xc5 && marker <= 0xc7) ||
+    (marker >= 0xc9 && marker <= 0xcb) ||
+    (marker >= 0xcd && marker <= 0xcf)
+  );
+}
+
+function readHeaderAscii(view, start, length) {
+  if (start + length > view.byteLength) return "";
+
+  let text = "";
+  for (let index = 0; index < length; index += 1) {
+    text += String.fromCharCode(view.getUint8(start + index));
+  }
+  return text;
+}
+
+function readUint24LE(view, offset) {
+  return view.getUint8(offset) | (view.getUint8(offset + 1) << 8) | (view.getUint8(offset + 2) << 16);
+}
+
 function formatSelectedFileDetail(file) {
   return `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
+}
+
+function renderPreviewMessage(container, message) {
+  container.replaceChildren();
+  container.dataset.previewKind = "empty";
+
+  const empty = document.createElement("p");
+  empty.className = "preview-empty";
+  empty.textContent = message;
+  container.append(empty);
 }
 
 function chooseAnotherFile() {
