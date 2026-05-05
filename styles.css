@@ -165,6 +165,10 @@ h2 {
   background: #f1f5f9;
 }
 
+.qr-wrap[data-qr-visible="false"] {
+  background: #e5e7eb;
+}
+
 .qr-code,
 .qr-code canvas,
 .qr-code img {
@@ -181,6 +185,27 @@ h2 {
   width: 100% !important;
   height: 100% !important;
   background: #fff;
+}
+
+.qr-placeholder {
+  width: min(100%, 256px);
+  aspect-ratio: 1;
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+  padding: 18px;
+  border-radius: 8px;
+  background: #d1d5db;
+  opacity: 0.72;
+}
+
+.qr-placeholder span {
+  border-radius: 2px;
+  background: #9ca3af;
+}
+
+.qr-placeholder span:nth-child(2n) {
+  background: #c7ccd3;
 }
 
 .qr-loading {
@@ -208,7 +233,34 @@ h2 {
   text-decoration: underline;
 }
 
-.qr-top-actions,
+.link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.link-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.room-id {
+  width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 700;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.qr-top-actions {
+  width: min(100%, 320px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(92px, auto);
+  gap: 10px;
+}
+
 .qr-actions {
   width: min(100%, 320px);
   display: grid;
@@ -427,6 +479,7 @@ h2 {
 }
 
 .download-button svg,
+.secondary-button svg,
 .icon-button svg,
 .action-button svg {
   width: 20px;
@@ -573,6 +626,22 @@ progress::-moz-progress-bar {
 
 .preview-overlay-content {
   height: min(78vh, 760px);
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 20;
+  max-width: min(420px, calc(100vw - 32px));
+  transform: translateX(-50%);
+  padding: 12px 16px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgba(23, 32, 42, 0.94);
+  box-shadow: 0 12px 28px rgba(24, 32, 44, 0.18);
+  font-weight: 800;
+  text-align: center;
 }
 
 @media (max-width: 740px) {

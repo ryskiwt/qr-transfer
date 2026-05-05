@@ -25,10 +25,14 @@ const els = {
   desktopView: document.querySelector("#desktop-view"),
   phoneView: document.querySelector("#phone-view"),
   unsupportedView: document.querySelector("#unsupported-view"),
+  qrWrap: document.querySelector("#qr-wrap"),
   qrCode: document.querySelector("#qr-code"),
   qrLoading: document.querySelector("#qr-loading"),
-  phoneLink: document.querySelector("#phone-link"),
+  toggleQr: document.querySelector("#toggle-qr"),
   refreshQr: document.querySelector("#refresh-qr"),
+  roomIdLabel: document.querySelector("#room-id-label"),
+  copyShareLink: document.querySelector("#copy-share-link"),
+  toast: document.querySelector("#toast"),
   desktopStatus: document.querySelector("#desktop-status"),
   phoneStatus: document.querySelector("#phone-status-text"),
   sendProgress: document.querySelector("#send-progress"),
@@ -61,9 +65,15 @@ const state = {
   peer: null,
   conn: null,
   connAuthenticated: false,
+  desktopConnections: new Set(),
+  authenticatedDesktopConnections: new Set(),
   targetPeerId: null,
   sessionSecret: null,
   sessionKeys: null,
+  desktopShareUrl: "",
+  desktopRoomId: "",
+  isQrVisible: false,
+  restoreQrVisibleOnReady: false,
   authNonce: null,
   phoneAuthFailed: false,
   pendingFile: null,
@@ -85,6 +95,7 @@ const state = {
   desktopRetryTimer: null,
   phoneReconnectTimer: null,
   phoneReconnectAttempts: 0,
+  toastTimer: null,
   receiverQueue: Promise.resolve(),
 };
 
@@ -126,9 +137,12 @@ function bindEvents() {
   els.captureAppCamera.addEventListener("click", captureAppCamera);
   els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
   els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
+  els.toggleQr.addEventListener("click", toggleDesktopQrVisibility);
   els.refreshQr.addEventListener("click", refreshDesktopSession);
+  els.copyShareLink.addEventListener("click", copyShareLink);
   els.previewOverlay.addEventListener("click", handlePreviewOverlayClick);
   document.addEventListener("keydown", handleDocumentKeydown);
+  window.addEventListener("resize", updateRoomIdLabel);
 }
 
 function showUnsupported(message = "このブラウザではWebRTCを利用できません。") {
@@ -163,6 +177,7 @@ function createDesktopPeer(peerId, retryCount = 0) {
   if (state.peer && !state.peer.destroyed) {
     state.peer.destroy();
   }
+  closeDesktopConnections();
   state.conn?.close?.();
   state.conn = null;
   state.connAuthenticated = false;
@@ -180,10 +195,7 @@ function createDesktopPeer(peerId, retryCount = 0) {
     els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
 
     const phoneUrl = buildPhoneUrl(id, state.sessionSecret);
-    els.phoneLink.href = phoneUrl;
-    els.phoneLink.textContent = formatPhoneUrlLabel(phoneUrl);
-    els.phoneLink.title = els.phoneLink.textContent;
-    renderQr(phoneUrl);
+    setDesktopShareUrl(phoneUrl, id);
   });
 
   peer.on("connection", (conn) => {
@@ -192,13 +204,7 @@ function createDesktopPeer(peerId, retryCount = 0) {
       return;
     }
 
-    if (state.conn?.open && state.connAuthenticated) {
-      conn.close();
-      return;
-    }
-
-    state.conn?.close?.();
-    state.conn = conn;
+    state.desktopConnections.add(conn);
     attachReceiver(conn);
   });
 
@@ -225,9 +231,11 @@ function refreshDesktopSession() {
 
   const peerId = createPeerId();
   const sessionSecret = createSessionSecret();
+  state.restoreQrVisibleOnReady = state.isQrVisible;
   writeDesktopSession({ peerId, secret: sessionSecret });
   setDesktopQrBusy("暗号鍵を準備中");
   window.clearTimeout(state.desktopRetryTimer);
+  closeDesktopConnections();
   state.conn?.close?.();
   state.peer?.destroy?.();
   state.conn = null;
@@ -241,6 +249,7 @@ function refreshDesktopSession() {
     ensureDesktopUrlHasRoom(peerId);
     createDesktopPeer(peerId);
   }).catch(() => {
+    state.restoreQrVisibleOnReady = false;
     setPill("暗号化エラー", "error");
     els.desktopStatus.textContent = "暗号鍵を準備できませんでした。ページを再読み込みしてください。";
     els.refreshQr.disabled = false;
@@ -384,14 +393,6 @@ function buildPhoneUrl(peerId, sessionSecret) {
   return url.toString();
 }
 
-function formatPhoneUrlLabel(urlText) {
-  const url = new URL(urlText);
-  const peer = url.searchParams.get("peer") || "";
-  const shortPeer = peer.length > 24 ? `${peer.slice(0, 18)}...${peer.slice(-6)}` : peer;
-
-  return `${url.host}${url.pathname}?peer=${shortPeer}#key=...`;
-}
-
 function ensureDesktopUrlHasRoom(peerId) {
   const url = new URL(window.location.href);
   if (url.searchParams.get("room") === peerId) return;
@@ -512,16 +513,62 @@ function base64UrlToBytes(text) {
   return bytes;
 }
 
-function renderQr(url) {
-  if (!window.QRCode) {
-    els.qrLoading.textContent = "QRコードを生成できません。下のリンクをスマートフォンで開いてください。";
-    els.refreshQr.disabled = false;
+function setDesktopShareUrl(url, peerId) {
+  state.desktopShareUrl = url;
+  state.desktopRoomId = peerId.replace(/^qr-transfer-/, "");
+  state.isQrVisible = state.restoreQrVisibleOnReady;
+  state.restoreQrVisibleOnReady = false;
+  updateRoomIdLabel();
+  renderDesktopQr();
+  updateDesktopQrControls();
+}
+
+function updateRoomIdLabel() {
+  if (!state.desktopRoomId) {
+    els.roomIdLabel.textContent = "Room ID: 準備中";
     return;
   }
 
+  const fullLabel = `Room ID: ${state.desktopRoomId}`;
+  els.roomIdLabel.textContent = fullLabel;
+
+  if (els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth) return;
+
+  const roomId = state.desktopRoomId;
+  for (let size = Math.floor(roomId.length / 2); size >= 4; size -= 1) {
+    els.roomIdLabel.textContent = `Room ID: ${roomId.slice(0, size)}...${roomId.slice(-size)}`;
+    if (els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth) return;
+  }
+
+  els.roomIdLabel.textContent = `Room ID: ${roomId.slice(0, 4)}...${roomId.slice(-4)}`;
+}
+
+function toggleDesktopQrVisibility() {
+  if (!state.desktopShareUrl || state.isClosing) return;
+
+  state.isQrVisible = !state.isQrVisible;
+  renderDesktopQr();
+  updateDesktopQrControls();
+}
+
+function renderDesktopQr() {
+  if (!state.desktopShareUrl || !state.isQrVisible) {
+    renderQrPlaceholder();
+    return;
+  }
+
+  if (!window.QRCode) {
+    state.isQrVisible = false;
+    renderQrPlaceholder();
+    els.qrLoading.textContent = "QRコードを生成できません。共有用リンクをコピーしてください。";
+    els.qrLoading.hidden = false;
+    return;
+  }
+
+  els.qrWrap.dataset.qrVisible = "true";
   els.qrCode.replaceChildren();
   new QRCode(els.qrCode, {
-    text: url,
+    text: state.desktopShareUrl,
     width: 256,
     height: 256,
     colorDark: "#111827",
@@ -529,62 +576,227 @@ function renderQr(url) {
     correctLevel: QRCode.CorrectLevel?.M ?? 0,
   });
   els.qrCode.removeAttribute("title");
+  els.qrCode.setAttribute("aria-label", "スマートフォン接続用QRコード");
   els.qrLoading.hidden = true;
+}
+
+function renderQrPlaceholder() {
+  const placeholder = document.createElement("div");
+  placeholder.className = "qr-placeholder";
+  placeholder.setAttribute("aria-hidden", "true");
+
+  for (let index = 0; index < 49; index += 1) {
+    placeholder.append(document.createElement("span"));
+  }
+
+  els.qrWrap.dataset.qrVisible = "false";
+  els.qrCode.replaceChildren(placeholder);
+  els.qrCode.removeAttribute("title");
+  els.qrCode.setAttribute("aria-label", "QRコードは非表示です");
+  els.qrLoading.hidden = true;
+}
+
+function updateDesktopQrControls() {
+  const hasShareUrl = Boolean(state.desktopShareUrl);
+  const label = els.toggleQr.querySelector("span");
+  const icon = els.toggleQr.querySelector("svg");
+
+  if (label) label.textContent = state.isQrVisible ? "QRコードを非表示" : "QRコードを表示";
+  if (icon) renderToggleQrIcon(icon, state.isQrVisible);
+  els.toggleQr.setAttribute("aria-pressed", state.isQrVisible ? "true" : "false");
+  els.toggleQr.disabled = !hasShareUrl;
   els.refreshQr.disabled = false;
+  els.copyShareLink.disabled = !hasShareUrl;
+}
+
+function renderToggleQrIcon(svg, isHidden) {
+  svg.replaceChildren();
+
+  if (isHidden) {
+    svg.append(
+      createSvgPath("M9.88 9.88a3 3 0 0 0 4.24 4.24"),
+      createSvgPath("M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-2.02 3.03"),
+      createSvgPath("M6.61 6.61C3.68 8.6 2 12 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"),
+      createSvgPath("M2 2l20 20"),
+    );
+    return;
+  }
+
+  svg.append(
+    createSvgPath("M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"),
+    createSvgCircle("12", "12", "3"),
+  );
+}
+
+function createSvgPath(d) {
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", d);
+  return path;
+}
+
+function createSvgCircle(cx, cy, r) {
+  const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  circle.setAttribute("cx", cx);
+  circle.setAttribute("cy", cy);
+  circle.setAttribute("r", r);
+  return circle;
 }
 
 function setDesktopQrBusy(message) {
+  state.desktopShareUrl = "";
+  state.desktopRoomId = "";
+  state.isQrVisible = false;
+  updateDesktopQrControls();
+  els.toggleQr.disabled = true;
   els.refreshQr.disabled = true;
-  els.phoneLink.removeAttribute("href");
-  els.phoneLink.textContent = "スマートフォン用リンクを準備中";
-  els.phoneLink.title = "";
-  els.qrCode.replaceChildren();
+  els.copyShareLink.disabled = true;
+  updateRoomIdLabel();
+  renderQrPlaceholder();
   els.qrLoading.textContent = message;
   els.qrLoading.hidden = false;
 }
 
+async function copyShareLink() {
+  if (!state.desktopShareUrl || els.copyShareLink.disabled) return;
+
+  try {
+    await writeClipboardText(state.desktopShareUrl);
+    showToast("共有用リンクをコピーしました");
+  } catch {
+    showToast("共有用リンクをコピーできませんでした");
+  }
+}
+
+async function writeClipboardText(text) {
+  if (window.navigator.clipboard?.writeText && window.isSecureContext) {
+    await window.navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.inset = "0 auto auto 0";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("Copy command failed");
+    }
+  } finally {
+    input.remove();
+  }
+}
+
+function showToast(message) {
+  window.clearTimeout(state.toastTimer);
+  els.toast.textContent = message;
+  els.toast.hidden = false;
+  state.toastTimer = window.setTimeout(() => {
+    els.toast.hidden = true;
+  }, 2200);
+}
+
+function closeDesktopConnections() {
+  const connections = [...state.desktopConnections];
+  state.desktopConnections.clear();
+  state.authenticatedDesktopConnections.clear();
+
+  for (const conn of connections) {
+    conn.close?.();
+  }
+}
+
+function removeDesktopConnection(conn) {
+  const wasAuthenticated = state.authenticatedDesktopConnections.delete(conn);
+  const wasKnown = state.desktopConnections.delete(conn);
+  return { wasKnown, wasAuthenticated };
+}
+
+function isDesktopConnectionActive(conn) {
+  return state.desktopConnections.has(conn) && !state.isClosing;
+}
+
+function isDesktopConnectionAuthenticated(conn) {
+  return state.authenticatedDesktopConnections.has(conn);
+}
+
+function setDesktopConnectionPill() {
+  const count = state.authenticatedDesktopConnections.size;
+  if (count < 1) return false;
+
+  setPill(`${count}台 接続済み`, count === 1 ? "success" : "warn");
+  return true;
+}
+
 function attachReceiver(conn) {
-  state.connAuthenticated = false;
-  state.receiverQueue = Promise.resolve();
-  setPill("認証中", "warn");
+  if (!setDesktopConnectionPill()) {
+    setPill("認証中", "warn");
+  }
   els.desktopStatus.textContent = "スマートフォンとの接続を確認しています";
 
   conn.on("open", () => {
-    if (state.conn !== conn || state.isClosing) return;
+    if (!isDesktopConnectionActive(conn)) return;
 
-    setPill("認証中", "warn");
+    if (!setDesktopConnectionPill()) {
+      setPill("認証中", "warn");
+    }
   });
 
   conn.on("data", (data) => {
-    if (state.conn !== conn || state.isClosing) return;
+    if (!isDesktopConnectionActive(conn)) return;
 
     state.receiverQueue = state.receiverQueue
       .then(() => handleIncomingData(data, conn))
       .catch(() => {
-        if (state.conn !== conn || state.isClosing) return;
+        if (!isDesktopConnectionActive(conn)) return;
 
-        setPill("受信エラー", "error");
+        removeDesktopConnection(conn);
+        if (!setDesktopConnectionPill()) {
+          setPill("受信エラー", "error");
+        }
         els.desktopStatus.textContent = "受信データを復号できませんでした。QRコードを再発行してください。";
-        state.conn = null;
-        state.connAuthenticated = false;
         conn.close();
       });
   });
 
   conn.on("close", () => {
-    if (state.conn !== conn || state.isClosing) return;
+    if (state.isClosing) return;
 
-    state.connAuthenticated = false;
-    setPill("切断", "warn");
-    els.desktopStatus.textContent = "スマートフォンからの再接続を待っています";
+    const { wasKnown, wasAuthenticated } = removeDesktopConnection(conn);
+    if (!wasKnown && !wasAuthenticated) return;
+
+    if (setDesktopConnectionPill()) {
+      els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+      return;
+    }
+
+    setPill(wasAuthenticated ? "切断" : "待機中", "warn");
+    els.desktopStatus.textContent = wasAuthenticated
+      ? "スマートフォンからの再接続を待っています"
+      : "スマートフォンからの送信を待っています";
   });
 
   conn.on("error", () => {
-    if (state.conn !== conn || state.isClosing) return;
+    if (state.isClosing) return;
 
-    state.connAuthenticated = false;
-    setPill("受信エラー", "error");
-    els.desktopStatus.textContent = "受信中にエラーが発生しました。接続をやり直してください。";
+    const { wasKnown, wasAuthenticated } = removeDesktopConnection(conn);
+    if (!wasKnown && !wasAuthenticated) return;
+
+    if (setDesktopConnectionPill()) {
+      els.desktopStatus.textContent = "一部の接続でエラーが発生しました。残りの端末からの送信を待っています";
+    } else if (wasAuthenticated) {
+      setPill("受信エラー", "error");
+      els.desktopStatus.textContent = "受信中にエラーが発生しました。接続をやり直してください。";
+    } else {
+      setPill("待機中", "warn");
+      els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+    }
+
+    conn.close();
   });
 }
 
@@ -673,10 +885,10 @@ async function handleAuthHello(data, conn) {
   }
 
   const token = await signAuthMessage(createAuthMessage("desktop", data.nonce));
-  if (state.conn !== conn || !conn.open || state.isClosing) return;
+  if (!isDesktopConnectionActive(conn) || !conn.open) return;
 
-  state.connAuthenticated = true;
-  setPill("接続済み", "success");
+  state.authenticatedDesktopConnections.add(conn);
+  setDesktopConnectionPill();
   els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
   conn.send({
     type: "auth-ok",
@@ -737,11 +949,12 @@ async function handleSenderData(data, conn) {
 }
 
 function rejectUnauthenticatedConnection(conn) {
-  if (state.conn === conn && !state.isClosing) {
-    state.connAuthenticated = false;
-    setPill("認証エラー", "error");
+  if (state.desktopConnections.has(conn) && !state.isClosing) {
+    removeDesktopConnection(conn);
+    if (!setDesktopConnectionPill()) {
+      setPill("認証エラー", "error");
+    }
     els.desktopStatus.textContent = "接続認証に失敗しました。QRコードを再発行してください。";
-    state.conn = null;
   }
 
   if (conn.open) {
@@ -937,7 +1150,7 @@ async function handleIncomingData(data, conn) {
     return;
   }
 
-  if (!state.connAuthenticated) {
+  if (!isDesktopConnectionAuthenticated(conn)) {
     rejectUnauthenticatedConnection(conn);
     return;
   }
@@ -1079,7 +1292,7 @@ function completeReceivingItem(id, transfer) {
   });
 
   state.incomingTransfers.delete(id);
-  setPill("受信完了", "success");
+  setDesktopConnectionPill();
   els.desktopStatus.textContent = "受信が完了しました。スマートフォンからの次の送信を待っています";
   openPreview();
 }
@@ -1890,6 +2103,7 @@ function cleanup() {
   for (const url of [...state.objectUrls]) {
     revokeObjectUrl(url);
   }
+  closeDesktopConnections();
   state.conn?.close?.();
   state.peer?.destroy?.();
 }
