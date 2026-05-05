@@ -241,7 +241,7 @@ h2 {
 }
 
 .desktop-grid .preview-content {
-  height: clamp(300px, 44vw, 520px);
+  height: clamp(340px, 32vw, 400px);
 }
 
 .preview-content[data-preview-kind="text"],
