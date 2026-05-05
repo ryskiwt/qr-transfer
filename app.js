@@ -4,10 +4,6 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
-const CAMERA_IMAGE_MAX_EDGE = 2560;
-const CAMERA_IMAGE_QUALITY = 0.85;
-const CAMERA_IMAGE_TYPE = "image/jpeg";
-const CAMERA_PROCESSING_SLOW_MS = 3000;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -543,31 +539,15 @@ async function handleFilePicked(event) {
   await showSelectedFilePreview(file, "file");
 }
 
-async function handleCameraPicked(event) {
+function handleCameraPicked(event) {
   const [file] = event.target.files;
   event.target.value = "";
   if (!file) return;
 
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "撮影した写真を処理しています";
-  await waitForNextPaint();
-
-  const slowTimer = window.setTimeout(() => {
-    els.phoneStatus.textContent = "写真の処理に時間がかかっています";
-  }, CAMERA_PROCESSING_SLOW_MS);
-
-  try {
-    const preparedFile = await prepareCameraImage(file);
-    await showSelectedFilePreview(preparedFile, "camera");
-    els.phoneStatus.textContent = "送信する写真を確認してください";
-  } catch {
-    await showSelectedFilePreview(file, "camera", {
-      skipImagePreview: true,
-    });
-    els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
-  } finally {
-    window.clearTimeout(slowTimer);
-  }
+  void showSelectedFilePreview(file, "camera", {
+    skipImagePreview: true,
+  });
+  els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
 }
 
 async function showSelectedFilePreview(file, source, options = {}) {
@@ -600,42 +580,6 @@ async function showSelectedFilePreview(file, source, options = {}) {
   setPhoneReady(Boolean(state.conn?.open));
 }
 
-async function prepareCameraImage(file) {
-  if (!file.type.startsWith("image/") || file.type === "image/svg+xml") {
-    return file;
-  }
-
-  if (!window.Compressor) {
-    throw new Error("Image compressor is not available");
-  }
-
-  return new Promise((resolve, reject) => {
-    new Compressor(file, {
-      checkOrientation: true,
-      maxWidth: CAMERA_IMAGE_MAX_EDGE,
-      maxHeight: CAMERA_IMAGE_MAX_EDGE,
-      mimeType: CAMERA_IMAGE_TYPE,
-      quality: CAMERA_IMAGE_QUALITY,
-      success(result) {
-        resolve(
-          new File([result], toJpegFileName(file.name), {
-            type: result.type || CAMERA_IMAGE_TYPE,
-            lastModified: Date.now(),
-          }),
-        );
-      },
-      error(error) {
-        reject(error);
-      },
-    });
-  });
-}
-
-function toJpegFileName(fileName) {
-  const baseName = fileName.replace(/\.[^.]*$/, "") || "photo";
-  return `${baseName}.jpg`;
-}
-
 function renderPreviewMessage(container, message) {
   container.replaceChildren();
   container.dataset.previewKind = "empty";
@@ -644,12 +588,6 @@ function renderPreviewMessage(container, message) {
   empty.className = "preview-empty";
   empty.textContent = message;
   container.append(empty);
-}
-
-function waitForNextPaint() {
-  return new Promise((resolve) => {
-    window.requestAnimationFrame(() => resolve());
-  });
 }
 
 function chooseAnotherFile() {
