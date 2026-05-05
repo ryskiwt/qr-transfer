@@ -2,6 +2,7 @@ const TRANSFER_CHUNK_SIZE = 64 * 1024;
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const OBSOLETE_DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
+const DESKTOP_SESSION_STORAGE_KEY = "qr-transfer-desktop-session-v1";
 const SESSION_SECRET_BYTES = 32;
 const AUTH_NONCE_BYTES = 16;
 const AES_GCM_IV_BYTES = 12;
@@ -148,12 +149,11 @@ async function startDesktop() {
   els.unsupportedView.hidden = true;
   setDesktopQrBusy("暗号鍵を準備中");
 
-  const peerId = createPeerId();
-  const sessionSecret = createSessionSecret();
-  state.sessionSecret = sessionSecret;
-  state.sessionKeys = await deriveSessionKeys(sessionSecret);
-  ensureDesktopUrlHasRoom(peerId);
-  createDesktopPeer(peerId);
+  const session = readDesktopSession() || writeDesktopSession(createDesktopSession());
+  state.sessionSecret = session.secret;
+  state.sessionKeys = await deriveSessionKeys(session.secret);
+  ensureDesktopUrlHasRoom(session.peerId);
+  createDesktopPeer(session.peerId);
 }
 
 function createDesktopPeer(peerId, retryCount = 0) {
@@ -225,6 +225,7 @@ function refreshDesktopSession() {
 
   const peerId = createPeerId();
   const sessionSecret = createSessionSecret();
+  writeDesktopSession({ peerId, secret: sessionSecret });
   setDesktopQrBusy("暗号鍵を準備中");
   window.clearTimeout(state.desktopRetryTimer);
   state.conn?.close?.();
@@ -246,6 +247,47 @@ function refreshDesktopSession() {
   });
   setPill("再発行中", "warn");
   els.desktopStatus.textContent = "新しいQRコードを発行しています";
+}
+
+function createDesktopSession() {
+  return {
+    peerId: createPeerId(),
+    secret: createSessionSecret(),
+  };
+}
+
+function readDesktopSession() {
+  try {
+    const rawSession = window.sessionStorage?.getItem(DESKTOP_SESSION_STORAGE_KEY);
+    if (!rawSession) return null;
+
+    const session = JSON.parse(rawSession);
+    if (!isValidDesktopSession(session)) return null;
+
+    return session;
+  } catch {
+    return null;
+  }
+}
+
+function writeDesktopSession(session) {
+  try {
+    window.sessionStorage?.setItem(DESKTOP_SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // sessionStorageが使えない場合は、現在のページ表示中だけ同じセッションを保持する。
+  }
+
+  return session;
+}
+
+function isValidDesktopSession(session) {
+  return (
+    session &&
+    typeof session === "object" &&
+    typeof session.peerId === "string" &&
+    /^qr-transfer-[0-9a-f]{24}$/.test(session.peerId) &&
+    isValidSessionSecret(session.secret)
+  );
 }
 
 async function startPhone(targetPeerId, sessionSecret) {
