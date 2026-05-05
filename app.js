@@ -52,6 +52,10 @@ const state = {
   pendingFileUrl: null,
   appCameraStream: null,
   appCameraRequestId: 0,
+  appCameraSensorRotation: 0,
+  appCameraSensorRotationAt: 0,
+  appCameraOrientationTracking: false,
+  appCameraOrientationPermissionRequested: false,
   isOpeningAppCamera: false,
   isCapturingAppCamera: false,
   incomingTransfers: new Map(),
@@ -589,6 +593,7 @@ async function openAppCamera() {
   setPhoneReady(false);
 
   try {
+    await ensureAppCameraOrientationTracking();
     const stream = await getBoundedCameraStream();
     if (requestId !== state.appCameraRequestId) {
       stopMediaStream(stream);
@@ -768,22 +773,71 @@ function getAppCameraCapture(video) {
 }
 
 function getAppCameraRotation(video) {
-  if (!isLandscapeOrientation() || video.videoWidth >= video.videoHeight) return 0;
+  if (video.videoWidth >= video.videoHeight) return 0;
 
-  if (screen.orientation?.type === "landscape-secondary") return -90;
+  const sensorRotation = getFreshAppCameraSensorRotation();
+  if (sensorRotation) return sensorRotation;
+
+  return getLandscapeOrientationRotation();
+}
+
+function getLandscapeOrientationRotation() {
+  const type = screen.orientation?.type || "";
+  if (type === "landscape-secondary") return -90;
+  if (type === "landscape-primary") return 90;
 
   const angle = getOrientationAngle();
   if (angle === -90 || angle === 270) return -90;
+  if (angle === 90 || angle === -270) return 90;
 
+  if (!isViewportLandscape()) return 0;
   return 90;
 }
 
-function isLandscapeOrientation() {
-  const type = screen.orientation?.type || "";
-  if (type.startsWith("landscape")) return true;
+function getFreshAppCameraSensorRotation() {
+  if (Date.now() - state.appCameraSensorRotationAt > 5000) return 0;
 
-  const angle = getOrientationAngle();
-  if (Math.abs(angle) === 90 || Math.abs(angle) === 270) return true;
+  return state.appCameraSensorRotation;
+}
+
+async function ensureAppCameraOrientationTracking() {
+  if (state.appCameraOrientationTracking || typeof DeviceOrientationEvent === "undefined") return;
+
+  if (typeof DeviceOrientationEvent.requestPermission === "function") {
+    if (state.appCameraOrientationPermissionRequested) return;
+
+    state.appCameraOrientationPermissionRequested = true;
+    try {
+      const permission = await DeviceOrientationEvent.requestPermission();
+      if (permission !== "granted") return;
+    } catch {
+      return;
+    }
+  }
+
+  window.addEventListener("deviceorientation", handleAppCameraDeviceOrientation, true);
+  state.appCameraOrientationTracking = true;
+}
+
+function handleAppCameraDeviceOrientation(event) {
+  if (typeof event.gamma !== "number") return;
+
+  const gamma = event.gamma;
+  if (Math.abs(gamma) >= 45) {
+    state.appCameraSensorRotation = gamma > 0 ? 90 : -90;
+    state.appCameraSensorRotationAt = Date.now();
+    return;
+  }
+
+  if (Math.abs(gamma) <= 25) {
+    state.appCameraSensorRotation = 0;
+    state.appCameraSensorRotationAt = Date.now();
+  }
+}
+
+function isViewportLandscape() {
+  const viewport = window.visualViewport;
+  if (viewport?.width && viewport?.height && viewport.width > viewport.height) return true;
 
   return window.matchMedia?.("(orientation: landscape)")?.matches || window.innerWidth > window.innerHeight;
 }
@@ -894,8 +948,9 @@ function chooseAnotherFile() {
 async function sendSelectedFile() {
   if (!state.pendingFile) return;
 
+  const source = state.pendingSource;
   const didSend = await sendFile(state.pendingFile);
-  if (didSend) {
+  if (didSend && source !== "app-camera") {
     clearPendingFile();
   }
 }
@@ -1034,6 +1089,7 @@ function cleanup() {
   state.isClosing = true;
   window.clearTimeout(state.desktopRetryTimer);
   window.clearTimeout(state.phoneReconnectTimer);
+  window.removeEventListener("deviceorientation", handleAppCameraDeviceOrientation, true);
   stopAppCameraStream();
   for (const url of [...state.objectUrls]) {
     revokeObjectUrl(url);
