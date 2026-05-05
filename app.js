@@ -946,9 +946,12 @@ async function showSelectedFilePreview(file, source) {
 
 async function getSelectedFilePreviewSkipMessage(file, source) {
   if (source !== "file" || !isImageFile(file)) return "";
+  if (isSvgFile(file)) return "";
 
   const dimensions = await readImageDimensions(file).catch(() => null);
-  if (!dimensions) return "";
+  if (!dimensions) {
+    return `画像サイズを安全に確認できないためスマートフォン側プレビューを省略します。${formatBytes(file.size)}`;
+  }
 
   const pixels = dimensions.width * dimensions.height;
   if (pixels <= FILE_IMAGE_PREVIEW_MAX_PIXELS) return "";
@@ -966,7 +969,11 @@ async function readImageDimensions(file) {
 }
 
 function isImageFile(file) {
-  return file.type.startsWith("image/") || /\.(jpe?g|png|gif|webp)$/i.test(file.name);
+  return file.type.startsWith("image/") || /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(file.name);
+}
+
+function isSvgFile(file) {
+  return file.type === "image/svg+xml" || /\.svg$/i.test(file.name);
 }
 
 async function readJpegDimensions(file) {
