@@ -1,23 +1,40 @@
-const TRANSFER_CHUNK_SIZE = 64 * 1024;
+import { SECURE_PROTOCOL_VERSION, TRANSFER_CHUNK_SIZE } from "./src/constants.js";
+import { bytesToBase64Url } from "./src/codec.js";
+import {
+  createAuthMessage as createProtocolAuthMessage,
+  createAuthNonce,
+  createRandomBytes,
+  createSessionSecret,
+  decryptBinaryPayload as decryptProtocolBinaryPayload,
+  decryptJsonPayload as decryptProtocolJsonPayload,
+  deriveSessionKeys,
+  encryptBinaryPayload as encryptProtocolBinaryPayload,
+  encryptJsonPayload as encryptProtocolJsonPayload,
+  isSecureCryptoSupported,
+  isValidSessionSecret,
+  signAuthMessage as signProtocolAuthMessage,
+  verifyAuthMessage as verifyProtocolAuthMessage,
+} from "./src/crypto-session.js";
+import { getSelectedFilePreviewSkipMessage } from "./src/file-review.js";
+import { getRoomIdFromPeerId, formatRoomIdLabel } from "./src/room-id.js";
+import {
+  canSendFile,
+  createFileChunkAad,
+  createFileMetaAad,
+  isValidChunkEnvelope,
+  normalizeFileMeta,
+} from "./src/transfer-protocol.js";
+
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const OBSOLETE_DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const DESKTOP_SESSION_STORAGE_KEY = "qr-transfer-desktop-session-v1";
-const SESSION_SECRET_BYTES = 32;
-const AUTH_NONCE_BYTES = 16;
-const AES_GCM_IV_BYTES = 12;
-const SECURE_PROTOCOL_VERSION = 1;
-const MAX_TRANSFER_CHUNKS = 65536;
-const MAX_FILE_NAME_LENGTH = 255;
-const MAX_MIME_LENGTH = 128;
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
 const APP_CAMERA_MAX_LONG_EDGE = 1920;
 const APP_CAMERA_MAX_SHORT_EDGE = 1440;
-const APP_CAMERA_JPEG_QUALITY = 0.88;
+const APP_CAMERA_JPEG_QUALITY = 0.92;
 const APP_CAMERA_READY_TIMEOUT_MS = 8000;
-const FILE_IMAGE_PREVIEW_MAX_PIXELS = 8 * 1000 * 1000;
-const IMAGE_HEADER_READ_BYTES = 512 * 1024;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -51,6 +68,7 @@ const els = {
   fileInput: document.querySelector("#file-input"),
   appCameraPanel: document.querySelector("#app-camera-panel"),
   appCameraVideo: document.querySelector("#app-camera-video"),
+  appCameraCanvas: document.querySelector("#app-camera-canvas"),
   closeAppCamera: document.querySelector("#close-app-camera"),
   captureAppCamera: document.querySelector("#capture-app-camera"),
   fileReviewPanel: document.querySelector("#file-review-panel"),
@@ -85,6 +103,7 @@ const state = {
   appCameraSensorRotationAt: 0,
   appCameraOrientationTracking: false,
   appCameraOrientationPermissionRequested: false,
+  appCameraFrameRequest: 0,
   isOpeningAppCamera: false,
   isCapturingAppCamera: false,
   currentReceivedPreview: null,
@@ -410,112 +429,14 @@ function createPeerId() {
   return `qr-transfer-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
-function createSessionSecret() {
-  return bytesToBase64Url(createRandomBytes(SESSION_SECRET_BYTES));
-}
-
-function createAuthNonce() {
-  return bytesToBase64Url(createRandomBytes(AUTH_NONCE_BYTES));
-}
-
-function createRandomBytes(length) {
-  const bytes = new Uint8Array(length);
-  window.crypto.getRandomValues(bytes);
-  return bytes;
-}
-
 function readSessionSecretFromHash() {
   const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
   return new URLSearchParams(hash).get("key") || "";
 }
 
-function isValidSessionSecret(secret) {
-  try {
-    return base64UrlToBytes(secret).byteLength === SESSION_SECRET_BYTES;
-  } catch {
-    return false;
-  }
-}
-
-function isSecureCryptoSupported() {
-  return Boolean(window.crypto?.getRandomValues && window.crypto?.subtle && window.TextEncoder && window.TextDecoder);
-}
-
-async function deriveSessionKeys(sessionSecret) {
-  const secretBytes = base64UrlToBytes(sessionSecret);
-  const baseKey = await window.crypto.subtle.importKey("raw", secretBytes, "HKDF", false, ["deriveKey"]);
-  const salt = encodeText("qr-transfer-v1");
-
-  const authKey = await window.crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt,
-      info: encodeText("auth"),
-    },
-    baseKey,
-    {
-      name: "HMAC",
-      hash: "SHA-256",
-      length: 256,
-    },
-    false,
-    ["sign", "verify"],
-  );
-
-  const encryptionKey = await window.crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt,
-      info: encodeText("file-encryption"),
-    },
-    baseKey,
-    {
-      name: "AES-GCM",
-      length: 256,
-    },
-    false,
-    ["encrypt", "decrypt"],
-  );
-
-  return { authKey, encryptionKey };
-}
-
-function encodeText(text) {
-  return new TextEncoder().encode(text);
-}
-
-function decodeText(bytes) {
-  return new TextDecoder().decode(bytes);
-}
-
-function bytesToBase64Url(bytes) {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function base64UrlToBytes(text) {
-  if (typeof text !== "string" || !/^[A-Za-z0-9_-]+$/.test(text)) {
-    throw new Error("Invalid base64url text");
-  }
-
-  const base64 = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
-  const binary = window.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
 function setDesktopShareUrl(url, peerId) {
   state.desktopShareUrl = url;
-  state.desktopRoomId = peerId.replace(/^qr-transfer-/, "");
+  state.desktopRoomId = getRoomIdFromPeerId(peerId);
   state.isQrVisible = state.restoreQrVisibleOnReady;
   state.restoreQrVisibleOnReady = false;
   updateRoomIdLabel();
@@ -529,18 +450,10 @@ function updateRoomIdLabel() {
     return;
   }
 
-  const fullLabel = `Room ID: ${state.desktopRoomId}`;
-  els.roomIdLabel.textContent = fullLabel;
-
-  if (els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth) return;
-
-  const roomId = state.desktopRoomId;
-  for (let size = Math.floor(roomId.length / 2); size >= 4; size -= 1) {
-    els.roomIdLabel.textContent = `Room ID: ${roomId.slice(0, size)}...${roomId.slice(-size)}`;
-    if (els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth) return;
-  }
-
-  els.roomIdLabel.textContent = `Room ID: ${roomId.slice(0, 4)}...${roomId.slice(-4)}`;
+  els.roomIdLabel.textContent = formatRoomIdLabel(state.desktopRoomId, (label) => {
+    els.roomIdLabel.textContent = label;
+    return els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth;
+  });
 }
 
 function toggleDesktopQrVisibility() {
@@ -609,10 +522,10 @@ function updateDesktopQrControls() {
   els.copyShareLink.disabled = !hasShareUrl;
 }
 
-function renderToggleQrIcon(svg, isHidden) {
+function renderToggleQrIcon(svg, isQrVisible) {
   svg.replaceChildren();
 
-  if (isHidden) {
+  if (isQrVisible) {
     svg.append(
       createSvgPath("M9.88 9.88a3 3 0 0 0 4.24 4.24"),
       createSvgPath("M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-2.02 3.03"),
@@ -728,7 +641,7 @@ function setDesktopConnectionPill() {
   const count = state.authenticatedDesktopConnections.size;
   if (count < 1) return false;
 
-  setPill(`${count}台 接続済み`, count === 1 ? "success" : "warn");
+  setPill(`${count}台 接続済み`, "success");
   return true;
 }
 
@@ -964,25 +877,15 @@ function rejectUnauthenticatedConnection(conn) {
 }
 
 function createAuthMessage(role, nonce) {
-  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|auth|${role}|${nonce}`;
+  return createProtocolAuthMessage(role, nonce);
 }
 
 async function signAuthMessage(message) {
-  const signature = await window.crypto.subtle.sign("HMAC", state.sessionKeys.authKey, encodeText(message));
-  return bytesToBase64Url(new Uint8Array(signature));
+  return signProtocolAuthMessage(state.sessionKeys, message);
 }
 
 async function verifyAuthMessage(message, token) {
-  try {
-    return await window.crypto.subtle.verify(
-      "HMAC",
-      state.sessionKeys.authKey,
-      base64UrlToBytes(token),
-      encodeText(message),
-    );
-  } catch {
-    return false;
-  }
+  return verifyProtocolAuthMessage(state.sessionKeys, message, token);
 }
 
 async function encryptFileMeta(meta) {
@@ -1035,111 +938,19 @@ async function decryptFileChunk(data) {
 }
 
 async function encryptJsonPayload(value, additionalData) {
-  return encryptBinaryPayload(encodeText(JSON.stringify(value)), additionalData);
+  return encryptProtocolJsonPayload(state.sessionKeys, value, additionalData);
 }
 
 async function decryptJsonPayload(payload, additionalData) {
-  const buffer = await decryptBinaryPayload(payload, additionalData);
-  return JSON.parse(decodeText(new Uint8Array(buffer)));
+  return decryptProtocolJsonPayload(state.sessionKeys, payload, additionalData);
 }
 
 async function encryptBinaryPayload(value, additionalData) {
-  const iv = createRandomBytes(AES_GCM_IV_BYTES);
-  const data = toArrayBuffer(value);
-  const ciphertext = await window.crypto.subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData: encodeText(additionalData),
-    },
-    state.sessionKeys.encryptionKey,
-    data,
-  );
-
-  return {
-    iv: iv.buffer,
-    data: ciphertext,
-  };
+  return encryptProtocolBinaryPayload(state.sessionKeys, value, additionalData);
 }
 
 async function decryptBinaryPayload(payload, additionalData) {
-  if (!payload || typeof payload !== "object") {
-    throw new Error("Missing encrypted payload");
-  }
-
-  const iv = toUint8Array(payload.iv);
-  if (iv.byteLength !== AES_GCM_IV_BYTES) {
-    throw new Error("Invalid AES-GCM IV length");
-  }
-
-  return window.crypto.subtle.decrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData: encodeText(additionalData),
-    },
-    state.sessionKeys.encryptionKey,
-    toArrayBuffer(payload.data),
-  );
-}
-
-function normalizeFileMeta(meta, id) {
-  if (!meta || typeof meta !== "object") {
-    throw new Error("Invalid file metadata");
-  }
-
-  const totalChunks = meta.totalChunks;
-  const size = meta.size;
-  const expectedTotalChunks = Math.max(1, Math.ceil(size / TRANSFER_CHUNK_SIZE));
-  if (
-    meta.id !== id ||
-    typeof meta.name !== "string" ||
-    meta.name.length < 1 ||
-    meta.name.length > MAX_FILE_NAME_LENGTH ||
-    typeof meta.mime !== "string" ||
-    meta.mime.length > MAX_MIME_LENGTH ||
-    !Number.isSafeInteger(size) ||
-    size < 0 ||
-    !Number.isSafeInteger(totalChunks) ||
-    totalChunks < 1 ||
-    totalChunks > MAX_TRANSFER_CHUNKS ||
-    totalChunks !== expectedTotalChunks
-  ) {
-    throw new Error("Invalid file metadata");
-  }
-
-  return {
-    id,
-    name: meta.name,
-    mime: meta.mime,
-    size,
-    totalChunks,
-  };
-}
-
-function createFileMetaAad(id) {
-  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|file-meta|${id}`;
-}
-
-function createFileChunkAad(id, index, byteLength) {
-  return `qr-transfer-v${SECURE_PROTOCOL_VERSION}|file-chunk|${id}|${index}|${byteLength}`;
-}
-
-function toUint8Array(value) {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-
-  throw new Error("Expected binary data");
-}
-
-function toArrayBuffer(value) {
-  const bytes = toUint8Array(value);
-  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
-    return bytes.buffer;
-  }
-
-  return bytes.slice().buffer;
+  return decryptProtocolBinaryPayload(state.sessionKeys, payload, additionalData);
 }
 
 async function handleIncomingData(data, conn) {
@@ -1185,23 +996,6 @@ async function handleIncomingData(data, conn) {
       completeReceivingItem(data.id, transfer);
     }
   }
-}
-
-function isValidChunkEnvelope(data, meta) {
-  if (
-    !Number.isSafeInteger(data.index) ||
-    data.index < 0 ||
-    data.index >= meta.totalChunks ||
-    !Number.isSafeInteger(data.byteLength) ||
-    data.byteLength < 0 ||
-    data.byteLength > TRANSFER_CHUNK_SIZE
-  ) {
-    return false;
-  }
-
-  const expectedLength =
-    data.index === meta.totalChunks - 1 ? meta.size - data.index * TRANSFER_CHUNK_SIZE : TRANSFER_CHUNK_SIZE;
-  return data.byteLength === expectedLength;
 }
 
 function createReceivingItem(meta) {
@@ -1448,6 +1242,7 @@ async function openAppCamera() {
       return;
     }
 
+    startAppCameraPreview();
     els.phoneStatus.textContent = "アプリ内カメラで撮影できます";
   } catch {
     if (requestId === state.appCameraRequestId) {
@@ -1470,24 +1265,20 @@ async function getBoundedCameraStream() {
       audio: false,
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1600, max: APP_CAMERA_MAX_LONG_EDGE },
-        height: { ideal: 1200, max: APP_CAMERA_MAX_LONG_EDGE },
-        resizeMode: "crop-and-scale",
+        width: { ideal: APP_CAMERA_MAX_LONG_EDGE },
+        height: { ideal: APP_CAMERA_MAX_SHORT_EDGE },
       },
     },
     {
       audio: false,
       video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1280, max: APP_CAMERA_MAX_LONG_EDGE },
-        height: { ideal: 960, max: APP_CAMERA_MAX_LONG_EDGE },
+        width: { ideal: APP_CAMERA_MAX_LONG_EDGE },
+        height: { ideal: APP_CAMERA_MAX_SHORT_EDGE },
       },
     },
     {
       audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-      },
+      video: true,
     },
   ];
 
@@ -1539,23 +1330,14 @@ async function captureAppCamera() {
   setPhoneReady(false);
   els.phoneStatus.textContent = "撮影した写真を作成しています";
 
-  const canvas = document.createElement("canvas");
-  const capture = getAppCameraCapture(video);
-  canvas.width = capture.width;
-  canvas.height = capture.height;
-
-  const context = canvas.getContext("2d", { alpha: false });
-  if (!context) {
+  const canvas = createAppCameraSnapshotCanvas(video);
+  if (!canvas) {
     state.isCapturingAppCamera = false;
-    canvas.width = 0;
-    canvas.height = 0;
     stopAppCameraStream();
     els.phoneStatus.textContent = "撮影画像を作成できませんでした。";
     setPhoneReady(isConnectionReady());
     return;
   }
-
-  drawAppCameraFrame(context, video, capture);
 
   try {
     const blob = await canvasToBlob(canvas, "image/jpeg", APP_CAMERA_JPEG_QUALITY);
@@ -1564,6 +1346,7 @@ async function captureAppCamera() {
       lastModified: Date.now(),
     });
 
+    stopAppCameraStream();
     await showSelectedFilePreview(file, "app-camera");
     els.phoneStatus.textContent = "撮影した写真を確認してください";
   } catch {
@@ -1586,6 +1369,65 @@ function calculateBoundedImageSize(width, height) {
     width: Math.max(1, Math.round(width * scale)),
     height: Math.max(1, Math.round(height * scale)),
   };
+}
+
+function startAppCameraPreview() {
+  stopAppCameraPreview();
+  renderAppCameraFrame();
+}
+
+function stopAppCameraPreview() {
+  if (state.appCameraFrameRequest) {
+    window.cancelAnimationFrame(state.appCameraFrameRequest);
+    state.appCameraFrameRequest = 0;
+  }
+}
+
+function renderAppCameraFrame() {
+  if (!state.appCameraStream) return;
+
+  const canvas = els.appCameraCanvas;
+  const context = canvas.getContext("2d", { alpha: false });
+  const size = getAppCameraCanvasSize(canvas, els.appCameraVideo);
+  if (context && size) {
+    if (canvas.width !== size.width || canvas.height !== size.height) {
+      canvas.width = size.width;
+      canvas.height = size.height;
+    }
+
+    drawAppCameraContainedFrame(context, els.appCameraVideo, canvas.width, canvas.height);
+  }
+
+  state.appCameraFrameRequest = window.requestAnimationFrame(renderAppCameraFrame);
+}
+
+function getAppCameraCanvasSize(canvas, video) {
+  const rect = canvas.getBoundingClientRect();
+  const cssWidth = canvas.clientWidth || rect.width;
+  const cssHeight = canvas.clientHeight || rect.height;
+  if (cssWidth > 0 && cssHeight > 0) {
+    const pixelRatio = window.devicePixelRatio || 1;
+    return calculateBoundedImageSize(cssWidth * pixelRatio, cssHeight * pixelRatio);
+  }
+
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    return calculateBoundedImageSize(video.videoWidth, video.videoHeight);
+  }
+
+  return null;
+}
+
+function createAppCameraSnapshotCanvas(video) {
+  const canvas = document.createElement("canvas");
+  const capture = getAppCameraCapture(video);
+  canvas.width = capture.width;
+  canvas.height = capture.height;
+
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) return null;
+
+  drawAppCameraFrame(context, video, capture);
+  return canvas;
 }
 
 function getAppCameraCapture(video) {
@@ -1677,6 +1519,31 @@ function getOrientationAngle() {
   return 0;
 }
 
+function drawAppCameraContainedFrame(context, video, width, height) {
+  const frame = getAppCameraOrientedFrame(video);
+  context.fillStyle = "#111827";
+  context.fillRect(0, 0, width, height);
+
+  const scale = Math.min(width / frame.width, height / frame.height);
+  const drawWidth = frame.width * scale;
+  const drawHeight = frame.height * scale;
+  const dx = (width - drawWidth) / 2;
+  const dy = (height - drawHeight) / 2;
+
+  drawAppCameraFrameAt(context, video, frame.rotation, dx, dy, drawWidth, drawHeight);
+}
+
+function getAppCameraOrientedFrame(video) {
+  const rotation = getAppCameraRotation(video);
+  const isSideways = Math.abs(rotation) === 90;
+
+  return {
+    width: isSideways ? video.videoHeight : video.videoWidth,
+    height: isSideways ? video.videoWidth : video.videoHeight,
+    rotation,
+  };
+}
+
 function drawAppCameraFrame(context, video, capture) {
   if (capture.rotation === 90) {
     context.translate(capture.width, 0);
@@ -1693,6 +1560,28 @@ function drawAppCameraFrame(context, video, capture) {
   }
 
   context.drawImage(video, 0, 0, capture.width, capture.height);
+}
+
+function drawAppCameraFrameAt(context, video, rotation, dx, dy, width, height) {
+  if (rotation === 90) {
+    context.save();
+    context.translate(dx + width, dy);
+    context.rotate(Math.PI / 2);
+    context.drawImage(video, 0, 0, height, width);
+    context.restore();
+    return;
+  }
+
+  if (rotation === -90) {
+    context.save();
+    context.translate(dx, dy + height);
+    context.rotate(-Math.PI / 2);
+    context.drawImage(video, 0, 0, height, width);
+    context.restore();
+    return;
+  }
+
+  context.drawImage(video, dx, dy, width, height);
 }
 
 function canvasToBlob(canvas, type, quality) {
@@ -1715,7 +1604,7 @@ function createCameraFileName() {
 async function showSelectedFilePreview(file, source) {
   clearPendingFile();
 
-  const skipPreviewMessage = await getSelectedFilePreviewSkipMessage(file, source);
+  const skipPreviewMessage = getSelectedFilePreviewSkipMessage(file, source, formatBytes);
   const url = skipPreviewMessage ? null : createObjectUrl(file);
   state.pendingFile = file;
   state.pendingSource = source;
@@ -1739,170 +1628,6 @@ async function showSelectedFilePreview(file, source) {
   }
   els.phoneStatus.textContent = "送信するファイルを確認してください";
   setPhoneReady(isConnectionReady());
-}
-
-async function getSelectedFilePreviewSkipMessage(file, source) {
-  if (source !== "file" || !isImageFile(file)) return "";
-  if (isSvgFile(file)) return "";
-
-  const dimensions = await readImageDimensions(file).catch(() => null);
-  if (!dimensions) {
-    return `画像サイズを安全に確認できないためスマートフォン側プレビューを省略します。${formatBytes(file.size)}`;
-  }
-
-  const pixels = dimensions.width * dimensions.height;
-  if (pixels <= FILE_IMAGE_PREVIEW_MAX_PIXELS) return "";
-
-  return `画像が大きいためスマートフォン側プレビューを省略します。${dimensions.width} x ${dimensions.height}px / ${formatBytes(file.size)}`;
-}
-
-async function readImageDimensions(file) {
-  if (isJpegFile(file)) return readJpegDimensions(file);
-  if (isPngFile(file)) return readPngDimensions(file);
-  if (isGifFile(file)) return readGifDimensions(file);
-  if (isWebpFile(file)) return readWebpDimensions(file);
-
-  return null;
-}
-
-function isImageFile(file) {
-  return file.type.startsWith("image/") || /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(file.name);
-}
-
-function isSvgFile(file) {
-  return file.type === "image/svg+xml" || /\.svg$/i.test(file.name);
-}
-
-async function readJpegDimensions(file) {
-  const buffer = await file.slice(0, Math.min(file.size, IMAGE_HEADER_READ_BYTES)).arrayBuffer();
-  const view = new DataView(buffer);
-  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null;
-
-  let offset = 2;
-  while (offset + 9 <= view.byteLength) {
-    if (view.getUint8(offset) !== 0xff) return null;
-
-    const marker = view.getUint8(offset + 1);
-    if (marker === 0xda || marker === 0xd9) return null;
-
-    const length = view.getUint16(offset + 2);
-    if (length < 2 || offset + 2 + length > view.byteLength) return null;
-
-    if (isJpegStartOfFrame(marker)) {
-      return {
-        width: view.getUint16(offset + 7),
-        height: view.getUint16(offset + 5),
-      };
-    }
-
-    offset += 2 + length;
-  }
-
-  return null;
-}
-
-async function readPngDimensions(file) {
-  const view = await readFileHeader(file, 24);
-  if (view.byteLength < 24 || view.getUint32(0) !== 0x89504e47 || view.getUint32(4) !== 0x0d0a1a0a) {
-    return null;
-  }
-
-  return {
-    width: view.getUint32(16),
-    height: view.getUint32(20),
-  };
-}
-
-async function readGifDimensions(file) {
-  const view = await readFileHeader(file, 10);
-  if (view.byteLength < 10) return null;
-
-  const signature = readHeaderAscii(view, 0, 6);
-  if (signature !== "GIF87a" && signature !== "GIF89a") return null;
-
-  return {
-    width: view.getUint16(6, true),
-    height: view.getUint16(8, true),
-  };
-}
-
-async function readWebpDimensions(file) {
-  const view = await readFileHeader(file, 64);
-  if (view.byteLength < 30 || readHeaderAscii(view, 0, 4) !== "RIFF" || readHeaderAscii(view, 8, 4) !== "WEBP") {
-    return null;
-  }
-
-  const chunkType = readHeaderAscii(view, 12, 4);
-  if (chunkType === "VP8X") {
-    return {
-      width: readUint24LE(view, 24) + 1,
-      height: readUint24LE(view, 27) + 1,
-    };
-  }
-
-  if (chunkType === "VP8 " && view.byteLength >= 30) {
-    return {
-      width: view.getUint16(26, true) & 0x3fff,
-      height: view.getUint16(28, true) & 0x3fff,
-    };
-  }
-
-  if (chunkType === "VP8L" && view.byteLength >= 25 && view.getUint8(20) === 0x2f) {
-    const b0 = view.getUint8(21);
-    const b1 = view.getUint8(22);
-    const b2 = view.getUint8(23);
-    const b3 = view.getUint8(24);
-
-    return {
-      width: 1 + (b0 | ((b1 & 0x3f) << 8)),
-      height: 1 + (((b1 & 0xc0) >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10)),
-    };
-  }
-
-  return null;
-}
-
-async function readFileHeader(file, bytes) {
-  return new DataView(await file.slice(0, Math.min(file.size, bytes)).arrayBuffer());
-}
-
-function isJpegFile(file) {
-  return file.type === "image/jpeg" || /\.jpe?g$/i.test(file.name);
-}
-
-function isPngFile(file) {
-  return file.type === "image/png" || /\.png$/i.test(file.name);
-}
-
-function isGifFile(file) {
-  return file.type === "image/gif" || /\.gif$/i.test(file.name);
-}
-
-function isWebpFile(file) {
-  return file.type === "image/webp" || /\.webp$/i.test(file.name);
-}
-
-function isJpegStartOfFrame(marker) {
-  return (
-    (marker >= 0xc0 && marker <= 0xc3) ||
-    (marker >= 0xc5 && marker <= 0xc7) ||
-    (marker >= 0xc9 && marker <= 0xcb) ||
-    (marker >= 0xcd && marker <= 0xcf)
-  );
-}
-
-function readHeaderAscii(view, start, length) {
-  if (start + length > view.byteLength) return "";
-
-  let text = "";
-  for (let index = 0; index < length; index += 1) {
-    text += String.fromCharCode(view.getUint8(start + index));
-  }
-  return text;
-}
-
-function readUint24LE(view, offset) {
-  return view.getUint8(offset) | (view.getUint8(offset + 1) << 8) | (view.getUint8(offset + 2) << 16);
 }
 
 function formatSelectedFileDetail(file) {
@@ -1976,12 +1701,15 @@ function closeAppCamera() {
 
 function stopAppCameraStream() {
   state.appCameraRequestId += 1;
+  stopAppCameraPreview();
   stopMediaStream(state.appCameraStream);
 
   state.appCameraStream = null;
   state.isOpeningAppCamera = false;
   els.appCameraVideo.pause();
   els.appCameraVideo.srcObject = null;
+  els.appCameraCanvas.width = 0;
+  els.appCameraCanvas.height = 0;
   els.appCameraPanel.hidden = true;
 }
 
@@ -2055,21 +1783,6 @@ async function sendFile(file) {
   }
 
   return didSend;
-}
-
-function canSendFile(file, totalChunks) {
-  return (
-    typeof file.name === "string" &&
-    file.name.length >= 1 &&
-    file.name.length <= MAX_FILE_NAME_LENGTH &&
-    typeof file.type === "string" &&
-    file.type.length <= MAX_MIME_LENGTH &&
-    Number.isSafeInteger(file.size) &&
-    file.size >= 0 &&
-    Number.isSafeInteger(totalChunks) &&
-    totalChunks >= 1 &&
-    totalChunks <= MAX_TRANSFER_CHUNKS
-  );
 }
 
 function waitForBuffer(conn) {
