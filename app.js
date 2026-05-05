@@ -547,9 +547,16 @@ async function handleCameraPicked(event) {
   event.target.value = "";
   if (!file) return;
 
-  const thumbnail = await extractEmbeddedThumbnail(file).catch(() => null);
+  setPhoneReady(false);
+  els.phoneStatus.textContent = "撮影した写真を確認しています";
+
+  const [thumbnail, diagnostics] = await Promise.all([
+    extractEmbeddedThumbnail(file).catch(() => null),
+    readImageDiagnostics(file).catch(() => null),
+  ]);
 
   await showSelectedFilePreview(file, "camera", {
+    diagnostics,
     previewBlob: thumbnail,
     skipImagePreview: !thumbnail,
     previewMessage: thumbnail ? null : "撮影した写真を選択しました。",
@@ -570,7 +577,7 @@ async function showSelectedFilePreview(file, source, options = {}) {
 
   els.fileReviewPanel.hidden = false;
   els.fileReviewName.textContent = file.name;
-  els.fileReviewDetail.textContent = `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
+  els.fileReviewDetail.textContent = formatSelectedFileDetail(file, options.diagnostics);
   els.chooseAnotherFile.textContent = source === "camera" ? "撮り直す" : "選び直す";
   if (url) {
     await renderFilePreview(els.fileReviewContent, {
@@ -588,6 +595,47 @@ async function showSelectedFilePreview(file, source, options = {}) {
     els.phoneStatus.textContent = "送信するファイルを確認してください";
   }
   setPhoneReady(Boolean(state.conn?.open));
+}
+
+async function readImageDiagnostics(file) {
+  if (!isJpegFile(file)) return null;
+
+  const dimensions = await readJpegDimensions(file);
+  return {
+    ...dimensions,
+    decodedBytes: dimensions.width * dimensions.height * 4,
+  };
+}
+
+async function readJpegDimensions(file) {
+  const buffer = await file.slice(0, Math.min(file.size, JPEG_THUMBNAIL_READ_BYTES)).arrayBuffer();
+  const view = new DataView(buffer);
+
+  if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) {
+    throw new Error("Unsupported JPEG");
+  }
+
+  let offset = 2;
+  while (offset + 9 <= view.byteLength) {
+    if (view.getUint8(offset) !== 0xff) break;
+
+    const marker = view.getUint8(offset + 1);
+    if (marker === 0xda || marker === 0xd9) break;
+
+    const length = view.getUint16(offset + 2);
+    if (length < 2 || offset + 2 + length > view.byteLength) break;
+
+    if (isJpegStartOfFrame(marker)) {
+      return {
+        width: view.getUint16(offset + 7),
+        height: view.getUint16(offset + 5),
+      };
+    }
+
+    offset += 2 + length;
+  }
+
+  throw new Error("JPEG dimensions not found");
 }
 
 async function extractEmbeddedThumbnail(file) {
@@ -696,6 +744,19 @@ async function extractEmbeddedJpegPreview(file) {
   return null;
 }
 
+function isJpegFile(file) {
+  return file.type === "image/jpeg" || /\.(jpe?g)$/i.test(file.name);
+}
+
+function isJpegStartOfFrame(marker) {
+  return (
+    (marker >= 0xc0 && marker <= 0xc3) ||
+    (marker >= 0xc5 && marker <= 0xc7) ||
+    (marker >= 0xc9 && marker <= 0xcb) ||
+    (marker >= 0xcd && marker <= 0xcf)
+  );
+}
+
 function readAscii(view, start, length) {
   if (start + length > view.byteLength) return "";
 
@@ -704,6 +765,17 @@ function readAscii(view, start, length) {
     text += String.fromCharCode(view.getUint8(start + index));
   }
   return text;
+}
+
+function formatSelectedFileDetail(file, diagnostics) {
+  const parts = [formatBytes(file.size), file.type || "application/octet-stream"];
+
+  if (diagnostics?.width && diagnostics?.height) {
+    parts.push(`${diagnostics.width} x ${diagnostics.height}px`);
+    parts.push(`展開目安 ${formatBytes(diagnostics.decodedBytes)}`);
+  }
+
+  return parts.join(" / ");
 }
 
 function renderPreviewMessage(container, message) {
