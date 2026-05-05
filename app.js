@@ -4,13 +4,6 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
-const CAMERA_JPEG_QUALITY = 0.98;
-const CAMERA_VIDEO_CONSTRAINTS = {
-  facingMode: { ideal: "environment" },
-  width: { ideal: 4096 },
-  height: { ideal: 3072 },
-  resizeMode: { ideal: "none" },
-};
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -31,31 +24,22 @@ const els = {
   pickFile: document.querySelector("#pick-file"),
   openCamera: document.querySelector("#open-camera"),
   fileInput: document.querySelector("#file-input"),
+  cameraInput: document.querySelector("#camera-input"),
   fileReviewPanel: document.querySelector("#file-review-panel"),
   fileReviewName: document.querySelector("#file-review-name"),
   fileReviewDetail: document.querySelector("#file-review-detail"),
   fileReviewContent: document.querySelector("#file-review-content"),
   chooseAnotherFile: document.querySelector("#choose-another-file"),
   sendSelectedFile: document.querySelector("#send-selected-file"),
-  cameraPanel: document.querySelector("#camera-panel"),
-  cameraPreview: document.querySelector("#camera-preview"),
-  captureCanvas: document.querySelector("#capture-canvas"),
-  capturedPreview: document.querySelector("#captured-preview"),
-  capturePhoto: document.querySelector("#capture-photo"),
-  reviewControls: document.querySelector("#review-controls"),
-  retakePhoto: document.querySelector("#retake-photo"),
-  sendPhoto: document.querySelector("#send-photo"),
 };
 
 const state = {
   peer: null,
   conn: null,
   targetPeerId: null,
-  cameraStream: null,
   pendingFile: null,
+  pendingSource: null,
   pendingFileUrl: null,
-  capturedBlob: null,
-  capturedPreviewUrl: null,
   incomingTransfers: new Map(),
   objectUrls: new Set(),
   isSending: false,
@@ -63,7 +47,6 @@ const state = {
   desktopRetryTimer: null,
   phoneReconnectTimer: null,
   phoneReconnectAttempts: 0,
-  isCapturing: false,
 };
 
 window.addEventListener("DOMContentLoaded", init);
@@ -90,12 +73,10 @@ function init() {
 function bindEvents() {
   els.pickFile.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", handleFilePicked);
+  els.cameraInput.addEventListener("change", handleCameraPicked);
   els.chooseAnotherFile.addEventListener("click", chooseAnotherFile);
   els.sendSelectedFile.addEventListener("click", sendSelectedFile);
   els.openCamera.addEventListener("click", openCamera);
-  els.capturePhoto.addEventListener("click", capturePhoto);
-  els.retakePhoto.addEventListener("click", resetCapture);
-  els.sendPhoto.addEventListener("click", sendCapturedPhoto);
 }
 
 function showUnsupported() {
@@ -495,9 +476,11 @@ async function showReceivedPreview({ blob, meta, url }) {
 
 async function renderFilePreview(container, { blob, meta, url }) {
   container.replaceChildren();
+  container.dataset.previewKind = "empty";
   const mime = blob.type || meta.mime || "";
 
   if (isTextPreviewable(meta.name, mime, blob.size)) {
+    container.dataset.previewKind = "text";
     const pre = document.createElement("pre");
     pre.className = "preview-text";
     pre.textContent = await blob.text();
@@ -506,6 +489,7 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("image/")) {
+    container.dataset.previewKind = "image";
     const image = document.createElement("img");
     image.src = url;
     image.alt = `${meta.name} のプレビュー`;
@@ -514,6 +498,7 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("video/")) {
+    container.dataset.previewKind = "video";
     const video = document.createElement("video");
     video.src = url;
     video.controls = true;
@@ -523,6 +508,7 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime.startsWith("audio/")) {
+    container.dataset.previewKind = "audio";
     const audio = document.createElement("audio");
     audio.src = url;
     audio.controls = true;
@@ -531,6 +517,7 @@ async function renderFilePreview(container, { blob, meta, url }) {
   }
 
   if (mime === "application/pdf") {
+    container.dataset.previewKind = "pdf";
     const frame = document.createElement("iframe");
     frame.src = url;
     frame.title = `${meta.name} のプレビュー`;
@@ -549,21 +536,29 @@ async function handleFilePicked(event) {
   event.target.value = "";
   if (!file) return;
 
-  await showSelectedFilePreview(file);
+  await showSelectedFilePreview(file, "file");
 }
 
-async function showSelectedFilePreview(file) {
-  resetCapture();
-  closeCamera();
+async function handleCameraPicked(event) {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (!file) return;
+
+  await showSelectedFilePreview(file, "camera");
+}
+
+async function showSelectedFilePreview(file, source) {
   clearPendingFile();
 
   const url = createObjectUrl(file);
   state.pendingFile = file;
+  state.pendingSource = source;
   state.pendingFileUrl = url;
 
   els.fileReviewPanel.hidden = false;
   els.fileReviewName.textContent = file.name;
   els.fileReviewDetail.textContent = `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
+  els.chooseAnotherFile.textContent = source === "camera" ? "撮り直す" : "選び直す";
   await renderFilePreview(els.fileReviewContent, {
     blob: file,
     meta: {
@@ -576,7 +571,13 @@ async function showSelectedFilePreview(file) {
 }
 
 function chooseAnotherFile() {
+  const source = state.pendingSource;
   clearPendingFile();
+  if (source === "camera") {
+    els.cameraInput.click();
+    return;
+  }
+
   els.fileInput.click();
 }
 
@@ -591,6 +592,7 @@ async function sendSelectedFile() {
 
 function clearPendingFile() {
   state.pendingFile = null;
+  state.pendingSource = null;
 
   if (state.pendingFileUrl) {
     revokeObjectUrl(state.pendingFileUrl);
@@ -600,133 +602,15 @@ function clearPendingFile() {
   els.fileReviewPanel.hidden = true;
   els.fileReviewName.textContent = "送信するファイル";
   els.fileReviewDetail.textContent = "";
+  els.chooseAnotherFile.textContent = "選び直す";
   els.fileReviewContent.replaceChildren();
+  els.fileReviewContent.dataset.previewKind = "empty";
   setPhoneReady(Boolean(state.conn?.open));
 }
 
-async function openCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    els.phoneStatus.textContent = "このブラウザではカメラを利用できません。";
-    return;
-  }
-
+function openCamera() {
   clearPendingFile();
-  closeCamera();
-  resetCapture();
-  els.cameraPanel.hidden = false;
-
-  try {
-    state.cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: CAMERA_VIDEO_CONSTRAINTS,
-      audio: false,
-    });
-    els.cameraPreview.srcObject = state.cameraStream;
-    els.cameraPreview.hidden = false;
-    els.phoneStatus.textContent = "撮影してください";
-  } catch {
-    els.cameraPanel.hidden = true;
-    els.phoneStatus.textContent = "カメラを開始できませんでした。ブラウザの権限設定を確認してください。";
-  }
-}
-
-async function capturePhoto() {
-  if (state.isCapturing) return;
-
-  state.isCapturing = true;
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "写真を作成しています";
-
-  try {
-    const photoBlob = await takeHighResolutionPhoto().catch(() => null);
-    if (photoBlob) {
-      showCapturedPhoto(photoBlob);
-      return;
-    }
-
-    // ImageCaptureに失敗した場合は、表示中の映像フレームを高品質JPEGとして保存する。
-    const frameBlob = await captureVideoFrame();
-    if (frameBlob) {
-      showCapturedPhoto(frameBlob);
-      return;
-    }
-
-    els.phoneStatus.textContent = "写真を作成できませんでした。もう一度撮影してください。";
-  } finally {
-    state.isCapturing = false;
-    setPhoneReady(Boolean(state.conn?.open));
-  }
-}
-
-async function takeHighResolutionPhoto() {
-  const [track] = state.cameraStream?.getVideoTracks?.() || [];
-  if (!track || !window.ImageCapture) return null;
-
-  const imageCapture = new ImageCapture(track);
-  const blob = await imageCapture.takePhoto();
-  return blob?.size ? blob : null;
-}
-
-function captureVideoFrame() {
-  const video = els.cameraPreview;
-  const width = video.videoWidth;
-  const height = video.videoHeight;
-
-  if (!width || !height) {
-    els.phoneStatus.textContent = "カメラ映像の準備中です。少し待ってから撮影してください。";
-    return Promise.resolve(null);
-  }
-
-  const canvas = els.captureCanvas;
-  canvas.width = width;
-  canvas.height = height;
-
-  const context = canvas.getContext("2d");
-  context.drawImage(video, 0, 0, width, height);
-
-  return new Promise((resolve) => {
-    canvas.toBlob(resolve, "image/jpeg", CAMERA_JPEG_QUALITY);
-  });
-}
-
-function showCapturedPhoto(blob) {
-  state.capturedBlob = blob;
-
-  if (state.capturedPreviewUrl) {
-    revokeObjectUrl(state.capturedPreviewUrl);
-  }
-
-  const previewUrl = createObjectUrl(blob);
-  state.capturedPreviewUrl = previewUrl;
-  els.capturedPreview.src = previewUrl;
-  els.capturedPreview.hidden = false;
-  els.cameraPreview.hidden = true;
-  els.capturePhoto.hidden = true;
-  els.reviewControls.hidden = false;
-  els.phoneStatus.textContent = "この写真を送信しますか？";
-}
-
-function resetCapture() {
-  state.capturedBlob = null;
-  if (state.capturedPreviewUrl) {
-    revokeObjectUrl(state.capturedPreviewUrl);
-    state.capturedPreviewUrl = null;
-  }
-  els.capturedPreview.removeAttribute("src");
-  els.capturedPreview.hidden = true;
-  els.cameraPreview.hidden = false;
-  els.capturePhoto.hidden = false;
-  els.reviewControls.hidden = true;
-}
-
-async function sendCapturedPhoto() {
-  if (!state.capturedBlob) return;
-
-  const mime = state.capturedBlob.type || "image/jpeg";
-  const extension = mime === "image/png" ? "png" : "jpg";
-  const file = new File([state.capturedBlob], `photo-${timestampForFileName()}.${extension}`, {
-    type: mime,
-  });
-  await sendFile(file);
+  els.cameraInput.click();
 }
 
 async function sendFile(file) {
@@ -811,28 +695,10 @@ function waitForBuffer(conn) {
   });
 }
 
-function closeCamera() {
-  if (state.cameraStream) {
-    for (const track of state.cameraStream.getTracks()) {
-      track.stop();
-    }
-    state.cameraStream = null;
-  }
-
-  if (els.cameraPreview) {
-    els.cameraPreview.srcObject = null;
-  }
-
-  if (els.cameraPanel) {
-    els.cameraPanel.hidden = true;
-  }
-}
-
 function cleanup() {
   state.isClosing = true;
   window.clearTimeout(state.desktopRetryTimer);
   window.clearTimeout(state.phoneReconnectTimer);
-  closeCamera();
   for (const url of [...state.objectUrls]) {
     revokeObjectUrl(url);
   }
@@ -841,14 +707,10 @@ function cleanup() {
 }
 
 function setPhoneReady(isReady) {
-  const canInteract = isReady && !state.isCapturing;
-  els.pickFile.disabled = !canInteract;
-  els.openCamera.disabled = !canInteract;
-  els.capturePhoto.disabled = !canInteract;
-  els.retakePhoto.disabled = !canInteract;
-  els.sendPhoto.disabled = !canInteract;
+  els.pickFile.disabled = !isReady;
+  els.openCamera.disabled = !isReady;
   els.chooseAnotherFile.disabled = state.isSending;
-  els.sendSelectedFile.disabled = !canInteract || !state.pendingFile;
+  els.sendSelectedFile.disabled = !isReady || !state.pendingFile;
 }
 
 function setPill(text, tone) {
@@ -924,19 +786,6 @@ function formatBytes(bytes) {
   const value = bytes / 1024 ** index;
 
   return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-function timestampForFileName() {
-  const now = new Date();
-  const parts = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-    String(now.getHours()).padStart(2, "0"),
-    String(now.getMinutes()).padStart(2, "0"),
-    String(now.getSeconds()).padStart(2, "0"),
-  ];
-  return `${parts[0]}${parts[1]}${parts[2]}-${parts[3]}${parts[4]}${parts[5]}`;
 }
 
 function formatPeerError(error) {

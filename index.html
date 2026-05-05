@@ -44,7 +44,7 @@
                   <p id="preview-detail" class="preview-detail"></p>
                 </div>
               </div>
-              <div id="preview-content" class="preview-content">
+              <div id="preview-content" class="preview-content" data-preview-kind="empty">
                 <p class="preview-empty">受信したファイルがここに表示されます。</p>
               </div>
             </section>
@@ -86,6 +86,7 @@
           </div>
 
           <input id="file-input" type="file" hidden />
+          <input id="camera-input" type="file" accept="image/*" capture="environment" hidden />
 
           <section id="file-review-panel" class="file-review-panel" hidden>
             <div class="section-heading">
@@ -94,25 +95,10 @@
                 <p id="file-review-detail" class="preview-detail"></p>
               </div>
             </div>
-            <div id="file-review-content" class="preview-content"></div>
+            <div id="file-review-content" class="preview-content" data-preview-kind="empty"></div>
             <div class="file-review-actions">
               <button id="choose-another-file" class="secondary-button" type="button">選び直す</button>
               <button id="send-selected-file" class="primary-button" type="button">送信する</button>
-            </div>
-          </section>
-
-          <section id="camera-panel" class="camera-panel" hidden>
-            <div class="camera-stage">
-              <video id="camera-preview" playsinline autoplay muted></video>
-              <canvas id="capture-canvas" hidden></canvas>
-              <img id="captured-preview" alt="撮影した写真のプレビュー" hidden />
-            </div>
-            <div class="camera-controls">
-              <button id="capture-photo" class="capture-button" type="button">撮影する</button>
-              <div id="review-controls" class="review-controls" hidden>
-                <button id="retake-photo" class="secondary-button" type="button">撮り直す</button>
-                <button id="send-photo" class="primary-button" type="button">送信する</button>
-              </div>
             </div>
           </section>
         </section>
