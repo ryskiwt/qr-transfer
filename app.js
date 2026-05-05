@@ -4,6 +4,13 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
+const CAMERA_JPEG_QUALITY = 0.98;
+const CAMERA_VIDEO_CONSTRAINTS = {
+  facingMode: { ideal: "environment" },
+  width: { ideal: 4096 },
+  height: { ideal: 3072 },
+  resizeMode: { ideal: "none" },
+};
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -56,6 +63,7 @@ const state = {
   desktopRetryTimer: null,
   phoneReconnectTimer: null,
   phoneReconnectAttempts: 0,
+  isCapturing: false,
 };
 
 window.addEventListener("DOMContentLoaded", init);
@@ -609,11 +617,7 @@ async function openCamera() {
 
   try {
     state.cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-      },
+      video: CAMERA_VIDEO_CONSTRAINTS,
       audio: false,
     });
     els.cameraPreview.srcObject = state.cameraStream;
@@ -625,14 +629,62 @@ async function openCamera() {
   }
 }
 
-function capturePhoto() {
+async function capturePhoto() {
+  if (state.isCapturing) return;
+
+  state.isCapturing = true;
+  setPhoneReady(false);
+  els.phoneStatus.textContent = "写真を作成しています";
+
+  try {
+    const photoBlob = await takeHighResolutionPhoto().catch(() => null);
+    if (photoBlob) {
+      showCapturedPhoto(photoBlob);
+      return;
+    }
+
+    // ImageCaptureに失敗した場合は、表示中の映像フレームを高品質JPEGとして保存する。
+    const frameBlob = await captureVideoFrame();
+    if (frameBlob) {
+      showCapturedPhoto(frameBlob);
+      return;
+    }
+
+    els.phoneStatus.textContent = "写真を作成できませんでした。もう一度撮影してください。";
+  } finally {
+    state.isCapturing = false;
+    setPhoneReady(Boolean(state.conn?.open));
+  }
+}
+
+async function takeHighResolutionPhoto() {
+  const [track] = state.cameraStream?.getVideoTracks?.() || [];
+  if (!track || !window.ImageCapture) return null;
+
+  const imageCapture = new ImageCapture(track);
+  const capabilities = await imageCapture.getPhotoCapabilities?.().catch(() => null);
+  const photoSettings = {};
+
+  if (capabilities?.imageWidth?.max) {
+    photoSettings.imageWidth = capabilities.imageWidth.max;
+  }
+
+  if (capabilities?.imageHeight?.max) {
+    photoSettings.imageHeight = capabilities.imageHeight.max;
+  }
+
+  const blob = await imageCapture.takePhoto(photoSettings);
+  return blob?.size ? blob : null;
+}
+
+function captureVideoFrame() {
   const video = els.cameraPreview;
   const width = video.videoWidth;
   const height = video.videoHeight;
 
   if (!width || !height) {
     els.phoneStatus.textContent = "カメラ映像の準備中です。少し待ってから撮影してください。";
-    return;
+    return Promise.resolve(null);
   }
 
   const canvas = els.captureCanvas;
@@ -642,26 +694,26 @@ function capturePhoto() {
   const context = canvas.getContext("2d");
   context.drawImage(video, 0, 0, width, height);
 
-  canvas.toBlob(
-    (blob) => {
-      if (!blob) {
-        els.phoneStatus.textContent = "写真を作成できませんでした。もう一度撮影してください。";
-        return;
-      }
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, "image/jpeg", CAMERA_JPEG_QUALITY);
+  });
+}
 
-      state.capturedBlob = blob;
-      const previewUrl = createObjectUrl(blob);
-      state.capturedPreviewUrl = previewUrl;
-      els.capturedPreview.src = previewUrl;
-      els.capturedPreview.hidden = false;
-      els.cameraPreview.hidden = true;
-      els.capturePhoto.hidden = true;
-      els.reviewControls.hidden = false;
-      els.phoneStatus.textContent = "この写真を送信しますか？";
-    },
-    "image/jpeg",
-    0.9,
-  );
+function showCapturedPhoto(blob) {
+  state.capturedBlob = blob;
+
+  if (state.capturedPreviewUrl) {
+    revokeObjectUrl(state.capturedPreviewUrl);
+  }
+
+  const previewUrl = createObjectUrl(blob);
+  state.capturedPreviewUrl = previewUrl;
+  els.capturedPreview.src = previewUrl;
+  els.capturedPreview.hidden = false;
+  els.cameraPreview.hidden = true;
+  els.capturePhoto.hidden = true;
+  els.reviewControls.hidden = false;
+  els.phoneStatus.textContent = "この写真を送信しますか？";
 }
 
 function resetCapture() {
@@ -680,8 +732,10 @@ function resetCapture() {
 async function sendCapturedPhoto() {
   if (!state.capturedBlob) return;
 
-  const file = new File([state.capturedBlob], `photo-${timestampForFileName()}.jpg`, {
-    type: "image/jpeg",
+  const mime = state.capturedBlob.type || "image/jpeg";
+  const extension = mime === "image/png" ? "png" : "jpg";
+  const file = new File([state.capturedBlob], `photo-${timestampForFileName()}.${extension}`, {
+    type: mime,
   });
   await sendFile(file);
 }
@@ -798,13 +852,14 @@ function cleanup() {
 }
 
 function setPhoneReady(isReady) {
-  els.pickFile.disabled = !isReady;
-  els.openCamera.disabled = !isReady;
-  els.capturePhoto.disabled = !isReady;
-  els.retakePhoto.disabled = !isReady;
-  els.sendPhoto.disabled = !isReady;
+  const canInteract = isReady && !state.isCapturing;
+  els.pickFile.disabled = !canInteract;
+  els.openCamera.disabled = !canInteract;
+  els.capturePhoto.disabled = !canInteract;
+  els.retakePhoto.disabled = !canInteract;
+  els.sendPhoto.disabled = !canInteract;
   els.chooseAnotherFile.disabled = state.isSending;
-  els.sendSelectedFile.disabled = !isReady || !state.pendingFile;
+  els.sendSelectedFile.disabled = !canInteract || !state.pendingFile;
 }
 
 function setPill(text, tone) {
