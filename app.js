@@ -662,18 +662,7 @@ async function takeHighResolutionPhoto() {
   if (!track || !window.ImageCapture) return null;
 
   const imageCapture = new ImageCapture(track);
-  const capabilities = await imageCapture.getPhotoCapabilities?.().catch(() => null);
-  const photoSettings = {};
-
-  if (capabilities?.imageWidth?.max) {
-    photoSettings.imageWidth = capabilities.imageWidth.max;
-  }
-
-  if (capabilities?.imageHeight?.max) {
-    photoSettings.imageHeight = capabilities.imageHeight.max;
-  }
-
-  const blob = await imageCapture.takePhoto(photoSettings);
+  const blob = await imageCapture.takePhoto();
   return blob?.size ? blob : null;
 }
 
