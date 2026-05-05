@@ -25,14 +25,17 @@ const els = {
   previewName: document.querySelector("#preview-name"),
   previewDetail: document.querySelector("#preview-detail"),
   previewContent: document.querySelector("#preview-content"),
+  openPreviewOverlay: document.querySelector("#open-preview-overlay"),
+  previewOverlay: document.querySelector("#preview-overlay"),
+  previewOverlayTitle: document.querySelector("#preview-overlay-title"),
+  previewOverlayDetail: document.querySelector("#preview-overlay-detail"),
+  previewOverlayContent: document.querySelector("#preview-overlay-content"),
+  closePreviewOverlay: document.querySelector("#close-preview-overlay"),
   pickFile: document.querySelector("#pick-file"),
   openAppCamera: document.querySelector("#open-app-camera"),
-  openCamera: document.querySelector("#open-camera"),
   fileInput: document.querySelector("#file-input"),
-  cameraInput: document.querySelector("#camera-input"),
   appCameraPanel: document.querySelector("#app-camera-panel"),
   appCameraVideo: document.querySelector("#app-camera-video"),
-  appCameraDetail: document.querySelector("#app-camera-detail"),
   closeAppCamera: document.querySelector("#close-app-camera"),
   captureAppCamera: document.querySelector("#capture-app-camera"),
   fileReviewPanel: document.querySelector("#file-review-panel"),
@@ -58,6 +61,7 @@ const state = {
   appCameraOrientationPermissionRequested: false,
   isOpeningAppCamera: false,
   isCapturingAppCamera: false,
+  currentReceivedPreview: null,
   incomingTransfers: new Map(),
   objectUrls: new Set(),
   isSending: false,
@@ -91,13 +95,15 @@ function init() {
 function bindEvents() {
   els.pickFile.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", handleFilePicked);
-  els.cameraInput.addEventListener("change", handleCameraPicked);
   els.chooseAnotherFile.addEventListener("click", chooseAnotherFile);
   els.sendSelectedFile.addEventListener("click", sendSelectedFile);
   els.openAppCamera.addEventListener("click", openAppCamera);
-  els.openCamera.addEventListener("click", openCamera);
   els.closeAppCamera.addEventListener("click", closeAppCamera);
   els.captureAppCamera.addEventListener("click", captureAppCamera);
+  els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
+  els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
+  els.previewOverlay.addEventListener("click", handlePreviewOverlayClick);
+  document.addEventListener("keydown", handleDocumentKeydown);
 }
 
 function showUnsupported() {
@@ -136,7 +142,8 @@ function createDesktopPeer(peerId, retryCount = 0) {
 
     const phoneUrl = buildPhoneUrl(id);
     els.phoneLink.href = phoneUrl;
-    els.phoneLink.textContent = phoneUrl;
+    els.phoneLink.textContent = formatPhoneUrlLabel(phoneUrl);
+    els.phoneLink.title = phoneUrl;
     renderQr(phoneUrl);
   });
 
@@ -239,6 +246,14 @@ function buildPhoneUrl(peerId) {
   url.hash = "";
   url.searchParams.set("peer", peerId);
   return url.toString();
+}
+
+function formatPhoneUrlLabel(urlText) {
+  const url = new URL(urlText);
+  const peer = url.searchParams.get("peer") || "";
+  const shortPeer = peer.length > 24 ? `${peer.slice(0, 18)}...${peer.slice(-6)}` : peer;
+
+  return `${url.host}${url.pathname}?peer=${shortPeer}`;
 }
 
 function getDesktopPeerId() {
@@ -490,9 +505,47 @@ function completeReceivingItem(id, transfer) {
 }
 
 async function showReceivedPreview({ blob, meta, url }) {
+  state.currentReceivedPreview = { blob, meta, url };
   els.previewName.textContent = meta.name;
   els.previewDetail.textContent = `${formatBytes(blob.size)} / ${meta.mime || "application/octet-stream"}`;
+  els.openPreviewOverlay.hidden = false;
   await renderFilePreview(els.previewContent, { blob, meta, url });
+
+  if (!els.previewOverlay.hidden) {
+    await renderPreviewOverlay({ blob, meta, url });
+  }
+}
+
+async function openPreviewOverlay() {
+  if (!state.currentReceivedPreview) return;
+
+  await renderPreviewOverlay(state.currentReceivedPreview);
+  els.previewOverlay.hidden = false;
+  els.closePreviewOverlay.focus();
+}
+
+async function renderPreviewOverlay({ blob, meta, url }) {
+  els.previewOverlayTitle.textContent = meta.name;
+  els.previewOverlayDetail.textContent = `${formatBytes(blob.size)} / ${meta.mime || "application/octet-stream"}`;
+  await renderFilePreview(els.previewOverlayContent, { blob, meta, url });
+}
+
+function closePreviewOverlay() {
+  els.previewOverlay.hidden = true;
+  els.previewOverlayContent.replaceChildren();
+  els.previewOverlayContent.dataset.previewKind = "empty";
+}
+
+function handlePreviewOverlayClick(event) {
+  if (event.target === els.previewOverlay) {
+    closePreviewOverlay();
+  }
+}
+
+function handleDocumentKeydown(event) {
+  if (event.key === "Escape" && !els.previewOverlay.hidden) {
+    closePreviewOverlay();
+  }
 }
 
 async function renderFilePreview(container, { blob, meta, url }) {
@@ -560,21 +613,6 @@ async function handleFilePicked(event) {
   await showSelectedFilePreview(file, "file");
 }
 
-async function handleCameraPicked(event) {
-  const [file] = event.target.files;
-  event.target.value = "";
-  if (!file) return;
-
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "撮影した写真を確認しています";
-
-  await showSelectedFilePreview(file, "camera", {
-    skipImagePreview: true,
-    previewMessage: "撮影した写真を選択しました。プレビューは省略しています。",
-  });
-  els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
-}
-
 async function openAppCamera() {
   clearPendingFile();
 
@@ -588,7 +626,6 @@ async function openAppCamera() {
   state.appCameraRequestId = requestId;
   state.isOpeningAppCamera = true;
   els.appCameraPanel.hidden = false;
-  els.appCameraDetail.textContent = "カメラを起動しています";
   els.phoneStatus.textContent = "アプリ内カメラを起動しています";
   setPhoneReady(false);
 
@@ -613,7 +650,6 @@ async function openAppCamera() {
       return;
     }
 
-    updateAppCameraDetail();
     els.phoneStatus.textContent = "アプリ内カメラで撮影できます";
   } catch {
     if (requestId === state.appCameraRequestId) {
@@ -695,11 +731,6 @@ function waitForVideoReady(video) {
     video.addEventListener("loadedmetadata", handleLoaded);
     video.addEventListener("error", handleError);
   });
-}
-
-function updateAppCameraDetail() {
-  els.appCameraDetail.textContent =
-    `撮影後は長辺${APP_CAMERA_MAX_LONG_EDGE}px、短辺${APP_CAMERA_MAX_SHORT_EDGE}px以内で保存し、横向き時は向きを補正します`;
 }
 
 async function captureAppCamera() {
@@ -884,11 +915,10 @@ function createCameraFileName() {
   return `qr-transfer-camera-${timestamp}.jpg`;
 }
 
-async function showSelectedFilePreview(file, source, options = {}) {
+async function showSelectedFilePreview(file, source) {
   clearPendingFile();
 
-  const previewBlob = options.previewBlob || null;
-  const url = previewBlob ? createObjectUrl(previewBlob) : options.skipImagePreview ? null : createObjectUrl(file);
+  const url = createObjectUrl(file);
   state.pendingFile = file;
   state.pendingSource = source;
   state.pendingFileUrl = url;
@@ -896,22 +926,16 @@ async function showSelectedFilePreview(file, source, options = {}) {
   els.fileReviewPanel.hidden = false;
   els.fileReviewName.textContent = file.name;
   els.fileReviewDetail.textContent = formatSelectedFileDetail(file);
-  els.chooseAnotherFile.textContent = source === "camera" || source === "app-camera" ? "撮り直す" : "選び直す";
-  if (url) {
-    await renderFilePreview(els.fileReviewContent, {
-      blob: previewBlob || file,
-      meta: {
-        name: file.name,
-        mime: previewBlob?.type || file.type,
-      },
-      url,
-    });
-  } else {
-    renderPreviewMessage(els.fileReviewContent, options.previewMessage || "撮影した写真を選択しました。");
-  }
-  if (source !== "camera") {
-    els.phoneStatus.textContent = "送信するファイルを確認してください";
-  }
+  els.chooseAnotherFile.textContent = source === "app-camera" ? "撮り直す" : "選び直す";
+  await renderFilePreview(els.fileReviewContent, {
+    blob: file,
+    meta: {
+      name: file.name,
+      mime: file.type,
+    },
+    url,
+  });
+  els.phoneStatus.textContent = "送信するファイルを確認してください";
   setPhoneReady(Boolean(state.conn?.open));
 }
 
@@ -919,26 +943,11 @@ function formatSelectedFileDetail(file) {
   return `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
 }
 
-function renderPreviewMessage(container, message) {
-  container.replaceChildren();
-  container.dataset.previewKind = "empty";
-
-  const empty = document.createElement("p");
-  empty.className = "preview-empty";
-  empty.textContent = message;
-  container.append(empty);
-}
-
 function chooseAnotherFile() {
   const source = state.pendingSource;
   clearPendingFile();
   if (source === "app-camera") {
     void openAppCamera();
-    return;
-  }
-
-  if (source === "camera") {
-    els.cameraInput.click();
     return;
   }
 
@@ -974,11 +983,6 @@ function clearPendingFile() {
   setPhoneReady(Boolean(state.conn?.open));
 }
 
-function openCamera() {
-  clearPendingFile();
-  els.cameraInput.click();
-}
-
 function closeAppCamera() {
   stopAppCameraStream();
   els.phoneStatus.textContent = "送信するファイルを選択してください";
@@ -994,7 +998,6 @@ function stopAppCameraStream() {
   els.appCameraVideo.pause();
   els.appCameraVideo.srcObject = null;
   els.appCameraPanel.hidden = true;
-  els.appCameraDetail.textContent = "";
 }
 
 function stopMediaStream(stream) {
@@ -1103,7 +1106,6 @@ function setPhoneReady(isReady) {
 
   els.pickFile.disabled = !isReady || appCameraBusy;
   els.openAppCamera.disabled = !isReady || appCameraBusy;
-  els.openCamera.disabled = !isReady || appCameraBusy;
   els.captureAppCamera.disabled = !state.appCameraStream || state.isSending || state.isCapturingAppCamera;
   els.closeAppCamera.disabled = state.isSending || state.isCapturingAppCamera;
   els.chooseAnotherFile.disabled = state.isSending;

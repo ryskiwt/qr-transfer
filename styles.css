@@ -222,7 +222,15 @@ h2 {
 
 .section-heading {
   min-height: 34px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
+}
+
+.section-heading > div {
+  min-width: 0;
 }
 
 .preview-detail,
@@ -406,6 +414,7 @@ h2 {
 }
 
 .download-button svg,
+.icon-button svg,
 .action-button svg {
   width: 20px;
   height: 20px;
@@ -414,6 +423,24 @@ h2 {
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.icon-button {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.icon-button:hover {
+  border-color: var(--accent);
+  background: var(--soft);
 }
 
 button:disabled,
@@ -453,7 +480,7 @@ progress::-moz-progress-bar {
 }
 
 .action-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .action-button {
@@ -499,6 +526,44 @@ progress::-moz-progress-bar {
 
 .app-camera-actions {
   margin-top: 12px;
+}
+
+.preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.72);
+}
+
+.preview-overlay-panel {
+  width: min(1180px, 100%);
+  max-height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 20px 64px rgba(15, 23, 42, 0.28);
+}
+
+.preview-overlay-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.preview-overlay-header > div {
+  min-width: 0;
+}
+
+.preview-overlay-content {
+  height: min(78vh, 760px);
 }
 
 @media (max-width: 740px) {
@@ -552,5 +617,17 @@ progress::-moz-progress-bar {
 
   .download-button {
     width: 100%;
+  }
+
+  .preview-overlay {
+    padding: 10px;
+  }
+
+  .preview-overlay-panel {
+    padding: 12px;
+  }
+
+  .preview-overlay-content {
+    height: 78vh;
   }
 }
