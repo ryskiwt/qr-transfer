@@ -4,6 +4,10 @@ const TEXT_PREVIEW_LIMIT = 1024 * 1024;
 const DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
 const PHONE_RECONNECT_BASE_DELAY = 700;
 const PHONE_RECONNECT_MAX_DELAY = 5000;
+const CAMERA_IMAGE_MAX_EDGE = 2560;
+const CAMERA_IMAGE_QUALITY = 0.85;
+const CAMERA_IMAGE_TYPE = "image/jpeg";
+const CAMERA_PROCESSING_SLOW_MS = 3000;
 
 const els = {
   viewTitle: document.querySelector("#view-title"),
@@ -544,13 +548,32 @@ async function handleCameraPicked(event) {
   event.target.value = "";
   if (!file) return;
 
-  await showSelectedFilePreview(file, "camera");
+  setPhoneReady(false);
+  els.phoneStatus.textContent = "撮影した写真を処理しています";
+  await waitForNextPaint();
+
+  const slowTimer = window.setTimeout(() => {
+    els.phoneStatus.textContent = "写真の処理に時間がかかっています";
+  }, CAMERA_PROCESSING_SLOW_MS);
+
+  try {
+    const preparedFile = await prepareCameraImage(file);
+    await showSelectedFilePreview(preparedFile, "camera");
+    els.phoneStatus.textContent = "送信する写真を確認してください";
+  } catch {
+    await showSelectedFilePreview(file, "camera", {
+      skipImagePreview: true,
+    });
+    els.phoneStatus.textContent = "撮影した写真を選択しました。プレビューを省略しています";
+  } finally {
+    window.clearTimeout(slowTimer);
+  }
 }
 
-async function showSelectedFilePreview(file, source) {
+async function showSelectedFilePreview(file, source, options = {}) {
   clearPendingFile();
 
-  const url = createObjectUrl(file);
+  const url = options.skipImagePreview ? null : createObjectUrl(file);
   state.pendingFile = file;
   state.pendingSource = source;
   state.pendingFileUrl = url;
@@ -559,15 +582,74 @@ async function showSelectedFilePreview(file, source) {
   els.fileReviewName.textContent = file.name;
   els.fileReviewDetail.textContent = `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
   els.chooseAnotherFile.textContent = source === "camera" ? "撮り直す" : "選び直す";
-  await renderFilePreview(els.fileReviewContent, {
-    blob: file,
-    meta: {
-      name: file.name,
-      mime: file.type,
-    },
-    url,
-  });
+  if (url) {
+    await renderFilePreview(els.fileReviewContent, {
+      blob: file,
+      meta: {
+        name: file.name,
+        mime: file.type,
+      },
+      url,
+    });
+  } else {
+    renderPreviewMessage(els.fileReviewContent, "撮影した写真を選択しました。");
+  }
+  if (source !== "camera") {
+    els.phoneStatus.textContent = "送信するファイルを確認してください";
+  }
   setPhoneReady(Boolean(state.conn?.open));
+}
+
+async function prepareCameraImage(file) {
+  if (!file.type.startsWith("image/") || file.type === "image/svg+xml") {
+    return file;
+  }
+
+  if (!window.Compressor) {
+    throw new Error("Image compressor is not available");
+  }
+
+  return new Promise((resolve, reject) => {
+    new Compressor(file, {
+      checkOrientation: true,
+      maxWidth: CAMERA_IMAGE_MAX_EDGE,
+      maxHeight: CAMERA_IMAGE_MAX_EDGE,
+      mimeType: CAMERA_IMAGE_TYPE,
+      quality: CAMERA_IMAGE_QUALITY,
+      success(result) {
+        resolve(
+          new File([result], toJpegFileName(file.name), {
+            type: result.type || CAMERA_IMAGE_TYPE,
+            lastModified: Date.now(),
+          }),
+        );
+      },
+      error(error) {
+        reject(error);
+      },
+    });
+  });
+}
+
+function toJpegFileName(fileName) {
+  const baseName = fileName.replace(/\.[^.]*$/, "") || "photo";
+  return `${baseName}.jpg`;
+}
+
+function renderPreviewMessage(container, message) {
+  container.replaceChildren();
+  container.dataset.previewKind = "empty";
+
+  const empty = document.createElement("p");
+  empty.className = "preview-empty";
+  empty.textContent = message;
+  container.append(empty);
+}
+
+function waitForNextPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 function chooseAnotherFile() {
