@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QR Transfer</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script
+      src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"
+      integrity="sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu"
+      crossorigin="anonymous"
+      defer
+    ></script>
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+      integrity="sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"
+      crossorigin="anonymous"
+      defer
+    ></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="app-frame" aria-live="polite">
+        <header class="topbar">
+          <h1 id="view-title" class="view-title">WebRTCでファイルを受信</h1>
+          <span id="connection-pill" class="pill">準備中</span>
+        </header>
+
+        <section id="desktop-view" class="view" hidden>
+          <div class="desktop-grid">
+            <div class="qr-panel">
+              <div id="qr-wrap" class="qr-wrap">
+                <div id="qr-code" class="qr-code" role="img" aria-label="スマートフォン接続用QRコード"></div>
+                <div id="qr-loading" class="qr-loading">QRコードを生成中</div>
+              </div>
+              <a id="phone-link" class="text-link" href="#" target="_blank" rel="noreferrer">スマートフォン用リンクを開く</a>
+            </div>
+
+            <section id="preview-area" class="preview-area" aria-label="受信ファイルプレビュー">
+              <div class="section-heading">
+                <div>
+                  <h2 id="preview-name">プレビュー</h2>
+                  <p id="preview-detail" class="preview-detail"></p>
+                </div>
+              </div>
+              <div id="preview-content" class="preview-content">
+                <p class="preview-empty">受信したファイルがここに表示されます。</p>
+              </div>
+            </section>
+          </div>
+
+          <p id="desktop-status" class="sr-only">スマートフォンからの送信を待っています</p>
+
+          <section class="receive-area" aria-label="受信ファイル">
+            <div class="section-heading">
+              <h2>受信ファイル</h2>
+            </div>
+            <div id="transfer-list" class="transfer-list">
+              <div class="empty-state">まだ受信したファイルはありません。</div>
+            </div>
+          </section>
+        </section>
+
+        <section id="phone-view" class="view" hidden>
+          <p id="phone-status-text" class="sr-only">PCへ接続しています</p>
+          <progress id="send-progress" max="100" value="0" hidden></progress>
+
+          <div class="action-grid">
+            <button id="pick-file" class="action-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <path d="M14 2v6h6" />
+                <path d="M12 18v-6" />
+                <path d="M9 15l3 3 3-3" />
+              </svg>
+              <span>ファイルから選択</span>
+            </button>
+            <button id="open-camera" class="action-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z" />
+                <circle cx="12" cy="13" r="3.5" />
+              </svg>
+              <span>カメラで撮影</span>
+            </button>
+          </div>
+
+          <input id="file-input" type="file" hidden />
+
+          <section id="file-review-panel" class="file-review-panel" hidden>
+            <div class="section-heading">
+              <div>
+                <h2 id="file-review-name">送信するファイル</h2>
+                <p id="file-review-detail" class="preview-detail"></p>
+              </div>
+            </div>
+            <div id="file-review-content" class="preview-content"></div>
+            <div class="file-review-actions">
+              <button id="choose-another-file" class="secondary-button" type="button">選び直す</button>
+              <button id="send-selected-file" class="primary-button" type="button">送信する</button>
+            </div>
+          </section>
+
+          <section id="camera-panel" class="camera-panel" hidden>
+            <div class="camera-stage">
+              <video id="camera-preview" playsinline autoplay muted></video>
+              <canvas id="capture-canvas" hidden></canvas>
+              <img id="captured-preview" alt="撮影した写真のプレビュー" hidden />
+            </div>
+            <div class="camera-controls">
+              <button id="capture-photo" class="capture-button" type="button">撮影する</button>
+              <div id="review-controls" class="review-controls" hidden>
+                <button id="retake-photo" class="secondary-button" type="button">撮り直す</button>
+                <button id="send-photo" class="primary-button" type="button">送信する</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section id="unsupported-view" class="view" hidden>
+          <p class="status-text">このブラウザではWebRTCまたはカメラ機能を利用できません。</p>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
