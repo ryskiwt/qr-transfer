@@ -287,7 +287,8 @@ h2 {
 
 .section-heading {
   min-height: 34px;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
@@ -296,6 +297,39 @@ h2 {
 
 .section-heading > div {
   min-width: 0;
+}
+
+.preview-title-block {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.preview-actions {
+  justify-self: end;
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.file-name-title {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.file-name-title__base {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name-title__extension {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .preview-detail,
@@ -507,6 +541,11 @@ h2 {
 .icon-button:hover {
   border-color: var(--accent);
   background: var(--soft);
+}
+
+.rotate-cw-icon path {
+  fill: currentColor;
+  stroke: none;
 }
 
 button:disabled,

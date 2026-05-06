@@ -16,6 +16,7 @@ import {
   verifyAuthMessage as verifyProtocolAuthMessage,
 } from "./src/crypto-session.js";
 import { getSelectedFilePreviewSkipMessage } from "./src/file-review.js";
+import { createJpegWithRotatedExifOrientation, isJpegFile } from "./src/jpeg-orientation.js";
 import { getRoomIdFromPeerId, formatRoomIdLabel } from "./src/room-id.js";
 import {
   canSendFile,
@@ -56,6 +57,7 @@ const els = {
   previewName: document.querySelector("#preview-name"),
   previewDetail: document.querySelector("#preview-detail"),
   previewContent: document.querySelector("#preview-content"),
+  rotatePreviewImage: document.querySelector("#rotate-preview-image"),
   openPreviewOverlay: document.querySelector("#open-preview-overlay"),
   previewOverlay: document.querySelector("#preview-overlay"),
   previewOverlayTitle: document.querySelector("#preview-overlay-title"),
@@ -151,6 +153,7 @@ function bindEvents() {
   els.openAppCamera.addEventListener("click", openAppCamera);
   els.closeAppCamera.addEventListener("click", closeAppCamera);
   els.captureAppCamera.addEventListener("click", captureAppCamera);
+  els.rotatePreviewImage.addEventListener("click", rotatePreviewImage);
   els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
   els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
   els.toggleQr.addEventListener("click", toggleReceiverQrVisibility);
@@ -1038,6 +1041,7 @@ function completeReceivingItem(id, transfer) {
     type: transfer.meta.mime || "application/octet-stream",
   });
   const url = createObjectUrl(blob);
+  let thumb = transfer.element.thumb;
 
   transfer.element.progress.remove();
   transfer.element.status.textContent = `${formatBytes(blob.size)} を受信しました`;
@@ -1049,6 +1053,7 @@ function completeReceivingItem(id, transfer) {
     img.alt = `${transfer.meta.name} のプレビュー`;
     transfer.element.thumb.replaceWith(img);
     transfer.element.thumb = img;
+    thumb = img;
   }
 
   const download = document.createElement("a");
@@ -1069,9 +1074,19 @@ function completeReceivingItem(id, transfer) {
   transfer.element.item.setAttribute("role", "button");
   transfer.element.item.setAttribute("aria-label", `${transfer.meta.name} をプレビュー`);
 
+  const receivedFile = {
+    blob,
+    meta: transfer.meta,
+    originalUrl: url,
+    activeBlob: blob,
+    activeUrl: url,
+    download,
+    thumb,
+  };
+
   const openPreview = () => {
     selectTransferItem(transfer.element.item);
-    void showReceivedPreview({ blob, meta: transfer.meta, url });
+    void showReceivedPreview(receivedFile);
   };
   transfer.element.item.addEventListener("click", openPreview);
   transfer.element.item.addEventListener("keydown", (event) => {
@@ -1087,15 +1102,48 @@ function completeReceivingItem(id, transfer) {
   openPreview();
 }
 
-async function showReceivedPreview({ blob, meta, url }) {
-  state.currentReceivedPreview = { blob, meta, url };
-  els.previewName.textContent = meta.name;
+async function rotatePreviewImage() {
+  const receivedFile = state.currentReceivedPreview;
+  if (!canRotateReceivedFile(receivedFile)) return;
+
+  els.rotatePreviewImage.disabled = true;
+
+  try {
+    const rotatedBlob = await createJpegWithRotatedExifOrientation(receivedFile.activeBlob);
+    const rotatedUrl = createObjectUrl(rotatedBlob);
+    const oldUrl = receivedFile.activeUrl;
+
+    receivedFile.activeBlob = rotatedBlob;
+    receivedFile.activeUrl = rotatedUrl;
+    receivedFile.download.href = rotatedUrl;
+    if (receivedFile.thumb instanceof HTMLImageElement) {
+      receivedFile.thumb.src = rotatedUrl;
+    }
+    if (oldUrl && oldUrl !== receivedFile.originalUrl) {
+      revokeObjectUrl(oldUrl);
+    }
+
+    await showReceivedPreview(receivedFile);
+    showToast("JPEGの回転情報を更新しました");
+  } catch {
+    showToast("このJPEGは回転できませんでした");
+  } finally {
+    els.rotatePreviewImage.disabled = false;
+  }
+}
+
+async function showReceivedPreview(receivedFile) {
+  const { blob, meta, url } = getReceivedPreviewData(receivedFile);
+
+  state.currentReceivedPreview = receivedFile;
+  renderFileNameTitle(els.previewName, meta.name);
   els.previewDetail.textContent = `${formatBytes(blob.size)} / ${meta.mime || "application/octet-stream"}`;
+  els.rotatePreviewImage.hidden = !canRotateReceivedFile(receivedFile);
   els.openPreviewOverlay.hidden = false;
   await renderFilePreview(els.previewContent, { blob, meta, url });
 
   if (!els.previewOverlay.hidden) {
-    await renderPreviewOverlay({ blob, meta, url });
+    await renderPreviewOverlay(receivedFile);
   }
 }
 
@@ -1107,10 +1155,59 @@ async function openPreviewOverlay() {
   els.closePreviewOverlay.focus();
 }
 
-async function renderPreviewOverlay({ blob, meta, url }) {
-  els.previewOverlayTitle.textContent = meta.name;
+async function renderPreviewOverlay(receivedFile) {
+  const { blob, meta, url } = getReceivedPreviewData(receivedFile);
+
+  renderFileNameTitle(els.previewOverlayTitle, meta.name);
   els.previewOverlayDetail.textContent = `${formatBytes(blob.size)} / ${meta.mime || "application/octet-stream"}`;
   await renderFilePreview(els.previewOverlayContent, { blob, meta, url });
+}
+
+function getReceivedPreviewData(receivedFile) {
+  return {
+    blob: receivedFile.activeBlob,
+    meta: receivedFile.meta,
+    url: receivedFile.activeUrl,
+  };
+}
+
+function canRotateReceivedFile(receivedFile) {
+  if (!receivedFile) return false;
+
+  const mime = receivedFile.activeBlob?.type || receivedFile.meta.mime || "";
+  return isJpegFile(receivedFile.meta.name, mime);
+}
+
+function renderFileNameTitle(element, fileName) {
+  const { baseName, extension } = splitFileNameExtension(fileName);
+  element.title = fileName;
+
+  const base = document.createElement("span");
+  base.className = "file-name-title__base";
+  base.textContent = baseName;
+
+  if (!extension) {
+    element.replaceChildren(base);
+    return;
+  }
+
+  const suffix = document.createElement("span");
+  suffix.className = "file-name-title__extension";
+  suffix.textContent = extension;
+
+  element.replaceChildren(base, suffix);
+}
+
+function splitFileNameExtension(fileName) {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return { baseName: fileName, extension: "" };
+  }
+
+  return {
+    baseName: fileName.slice(0, dotIndex),
+    extension: fileName.slice(dotIndex),
+  };
 }
 
 function closePreviewOverlay() {
