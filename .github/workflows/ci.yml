@@ -10,6 +10,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  attestations: write
 
 concurrency:
   group: pages
@@ -43,14 +44,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Build Pages site
+        run: npm run build:pages
+
+      - name: Generate SBOM and checksums
+        run: npm run release:metadata
+
+      - name: Attest Pages files
+        uses: actions/attest@v4
+        with:
+          subject-checksums: site.sha256
+
+      - name: Attest Pages SBOM
+        uses: actions/attest@v4
+        with:
+          subject-checksums: site.sha256
+          sbom-path: qr-transfer-site.spdx.json
+
+      - name: Upload verification metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: qr-transfer-verification-metadata
+          path: |
+            site.sha256
+            qr-transfer-site.spdx.json
+
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload static site
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
-          path: .
+          path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

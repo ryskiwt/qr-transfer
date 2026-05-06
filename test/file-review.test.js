@@ -5,12 +5,12 @@ import { getSelectedFilePreviewSkipMessage } from "../src/file-review.js";
 
 const formatBytes = (bytes) => `${bytes} B`;
 
-test("file picker selections always skip phone-side preview", () => {
+test("file picker selections always skip sender-side preview", () => {
   const file = { size: 123456 };
 
   assert.equal(
     getSelectedFilePreviewSkipMessage(file, "file", formatBytes),
-    "スマートフォン側プレビューは省略します。123456 B",
+    "送信側プレビューは省略します。123456 B",
   );
 });
 

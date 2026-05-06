@@ -1,0 +1,4 @@
+!.gitignore
+_site/
+qr-transfer-site.spdx.json
+site.sha256

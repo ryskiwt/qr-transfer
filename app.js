@@ -27,10 +27,9 @@ import {
 
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const TEXT_PREVIEW_LIMIT = 1024 * 1024;
-const OBSOLETE_DESKTOP_PEER_STORAGE_KEY = "qr-transfer-desktop-peer-id";
-const DESKTOP_SESSION_STORAGE_KEY = "qr-transfer-desktop-session-v1";
-const PHONE_RECONNECT_BASE_DELAY = 700;
-const PHONE_RECONNECT_MAX_DELAY = 5000;
+const RECEIVER_SESSION_STORAGE_KEY = "qr-transfer-receiver-session-v1";
+const SENDER_RECONNECT_BASE_DELAY = 700;
+const SENDER_RECONNECT_MAX_DELAY = 5000;
 const APP_CAMERA_MAX_LONG_EDGE = 1920;
 const APP_CAMERA_MAX_SHORT_EDGE = 1440;
 const APP_CAMERA_JPEG_QUALITY = 0.92;
@@ -39,8 +38,8 @@ const APP_CAMERA_READY_TIMEOUT_MS = 8000;
 const els = {
   viewTitle: document.querySelector("#view-title"),
   pill: document.querySelector("#connection-pill"),
-  desktopView: document.querySelector("#desktop-view"),
-  phoneView: document.querySelector("#phone-view"),
+  receiverView: document.querySelector("#receiver-view"),
+  senderView: document.querySelector("#sender-view"),
   unsupportedView: document.querySelector("#unsupported-view"),
   qrWrap: document.querySelector("#qr-wrap"),
   qrCode: document.querySelector("#qr-code"),
@@ -50,8 +49,8 @@ const els = {
   roomIdLabel: document.querySelector("#room-id-label"),
   copyShareLink: document.querySelector("#copy-share-link"),
   toast: document.querySelector("#toast"),
-  desktopStatus: document.querySelector("#desktop-status"),
-  phoneStatus: document.querySelector("#phone-status-text"),
+  receiverStatus: document.querySelector("#receiver-status"),
+  senderStatus: document.querySelector("#sender-status-text"),
   sendProgress: document.querySelector("#send-progress"),
   transferList: document.querySelector("#transfer-list"),
   previewName: document.querySelector("#preview-name"),
@@ -83,17 +82,17 @@ const state = {
   peer: null,
   conn: null,
   connAuthenticated: false,
-  desktopConnections: new Set(),
-  authenticatedDesktopConnections: new Set(),
+  receiverConnections: new Set(),
+  authenticatedReceiverConnections: new Set(),
   targetPeerId: null,
   sessionSecret: null,
   sessionKeys: null,
-  desktopShareUrl: "",
-  desktopRoomId: "",
+  receiverShareUrl: "",
+  receiverRoomId: "",
   isQrVisible: false,
   restoreQrVisibleOnReady: false,
   authNonce: null,
-  phoneAuthFailed: false,
+  senderAuthFailed: false,
   pendingFile: null,
   pendingSource: null,
   pendingFileUrl: null,
@@ -111,9 +110,9 @@ const state = {
   objectUrls: new Set(),
   isSending: false,
   isClosing: false,
-  desktopRetryTimer: null,
-  phoneReconnectTimer: null,
-  phoneReconnectAttempts: 0,
+  receiverRetryTimer: null,
+  senderReconnectTimer: null,
+  senderReconnectAttempts: 0,
   toastTimer: null,
   receiverQueue: Promise.resolve(),
 };
@@ -122,8 +121,6 @@ window.addEventListener("DOMContentLoaded", init);
 window.addEventListener("beforeunload", cleanup);
 
 function init() {
-  clearObsoleteStorage();
-
   if (!window.Peer || !window.RTCPeerConnection || !isSecureCryptoSupported()) {
     showUnsupported("このブラウザではWebRTCまたは安全な暗号化を利用できません。");
     return;
@@ -135,12 +132,12 @@ function init() {
   const targetPeerId = params.get("peer");
 
   if (targetPeerId) {
-    void startPhone(targetPeerId, readSessionSecretFromHash()).catch(() => {
+    void startSender(targetPeerId, readSessionSecretFromHash()).catch(() => {
       setPill("暗号化エラー", "error");
-      els.phoneStatus.textContent = "暗号鍵を準備できませんでした。QRコードを読み取り直してください。";
+      els.senderStatus.textContent = "暗号鍵を準備できませんでした。QRコードを読み取り直してください。";
     });
   } else {
-    void startDesktop().catch(() => {
+    void startReceiver().catch(() => {
       showUnsupported("暗号鍵を準備できませんでした。HTTPSまたはlocalhostで開いてください。");
     });
   }
@@ -156,8 +153,8 @@ function bindEvents() {
   els.captureAppCamera.addEventListener("click", captureAppCamera);
   els.openPreviewOverlay.addEventListener("click", openPreviewOverlay);
   els.closePreviewOverlay.addEventListener("click", closePreviewOverlay);
-  els.toggleQr.addEventListener("click", toggleDesktopQrVisibility);
-  els.refreshQr.addEventListener("click", refreshDesktopSession);
+  els.toggleQr.addEventListener("click", toggleReceiverQrVisibility);
+  els.refreshQr.addEventListener("click", refreshReceiverSession);
   els.copyShareLink.addEventListener("click", copyShareLink);
   els.previewOverlay.addEventListener("click", handlePreviewOverlayClick);
   document.addEventListener("keydown", handleDocumentKeydown);
@@ -167,36 +164,36 @@ function bindEvents() {
 function showUnsupported(message = "このブラウザではWebRTCを利用できません。") {
   els.viewTitle.textContent = "WebRTCを利用できません";
   setPill("非対応", "error");
-  els.desktopView.hidden = true;
-  els.phoneView.hidden = true;
+  els.receiverView.hidden = true;
+  els.senderView.hidden = true;
   els.unsupportedView.hidden = false;
   const status = els.unsupportedView.querySelector(".status-text");
   if (status) status.textContent = message;
 }
 
-async function startDesktop() {
+async function startReceiver() {
   els.viewTitle.textContent = "WebRTCでファイルを受信";
   setPill("接続準備中");
-  els.desktopView.hidden = false;
-  els.phoneView.hidden = true;
+  els.receiverView.hidden = false;
+  els.senderView.hidden = true;
   els.unsupportedView.hidden = true;
-  setDesktopQrBusy("暗号鍵を準備中");
+  setReceiverQrBusy("暗号鍵を準備中");
 
-  const session = readDesktopSession() || writeDesktopSession(createDesktopSession());
+  const session = readReceiverSession() || writeReceiverSession(createReceiverSession());
   state.sessionSecret = session.secret;
   state.sessionKeys = await deriveSessionKeys(session.secret);
-  ensureDesktopUrlHasRoom(session.peerId);
-  createDesktopPeer(session.peerId);
+  ensureReceiverUrlHasRoom(session.peerId);
+  createReceiverPeer(session.peerId);
 }
 
-function createDesktopPeer(peerId, retryCount = 0) {
-  window.clearTimeout(state.desktopRetryTimer);
-  setDesktopQrBusy(retryCount ? "接続IDを再利用できるまで待っています" : "QRコードを生成中");
+function createReceiverPeer(peerId, retryCount = 0) {
+  window.clearTimeout(state.receiverRetryTimer);
+  setReceiverQrBusy(retryCount ? "接続IDを再利用できるまで待っています" : "QRコードを生成中");
 
   if (state.peer && !state.peer.destroyed) {
     state.peer.destroy();
   }
-  closeDesktopConnections();
+  closeReceiverConnections();
   state.conn?.close?.();
   state.conn = null;
   state.connAuthenticated = false;
@@ -211,10 +208,10 @@ function createDesktopPeer(peerId, retryCount = 0) {
     if (state.peer !== peer || state.isClosing) return;
 
     setPill("待機中", "warn");
-    els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+    els.receiverStatus.textContent = "送信側からの送信を待っています";
 
-    const phoneUrl = buildPhoneUrl(id, state.sessionSecret);
-    setDesktopShareUrl(phoneUrl, id);
+    const senderUrl = buildSenderUrl(id, state.sessionSecret);
+    setReceiverShareUrl(senderUrl, id);
   });
 
   peer.on("connection", (conn) => {
@@ -223,7 +220,7 @@ function createDesktopPeer(peerId, retryCount = 0) {
       return;
     }
 
-    state.desktopConnections.add(conn);
+    state.receiverConnections.add(conn);
     attachReceiver(conn);
   });
 
@@ -233,28 +230,28 @@ function createDesktopPeer(peerId, retryCount = 0) {
     if (error?.type === "unavailable-id" && !state.isClosing) {
       const delay = Math.min(800 + retryCount * 350, 3500);
       setPill("再接続準備中", "warn");
-      els.desktopStatus.textContent =
-        "前の接続を閉じています。スマートフォンからの送信を待てる状態へ戻しています";
-      state.desktopRetryTimer = window.setTimeout(() => createDesktopPeer(peerId, retryCount + 1), delay);
+      els.receiverStatus.textContent =
+        "前の接続を閉じています。送信側からの送信を待てる状態へ戻しています";
+      state.receiverRetryTimer = window.setTimeout(() => createReceiverPeer(peerId, retryCount + 1), delay);
       return;
     }
 
     setPill("接続エラー", "error");
-    els.desktopStatus.textContent = formatPeerError(error);
+    els.receiverStatus.textContent = formatPeerError(error);
     els.refreshQr.disabled = false;
   });
 }
 
-function refreshDesktopSession() {
-  if (els.desktopView.hidden || state.isClosing) return;
+function refreshReceiverSession() {
+  if (els.receiverView.hidden || state.isClosing) return;
 
   const peerId = createPeerId();
   const sessionSecret = createSessionSecret();
   state.restoreQrVisibleOnReady = state.isQrVisible;
-  writeDesktopSession({ peerId, secret: sessionSecret });
-  setDesktopQrBusy("暗号鍵を準備中");
-  window.clearTimeout(state.desktopRetryTimer);
-  closeDesktopConnections();
+  writeReceiverSession({ peerId, secret: sessionSecret });
+  setReceiverQrBusy("暗号鍵を準備中");
+  window.clearTimeout(state.receiverRetryTimer);
+  closeReceiverConnections();
   state.conn?.close?.();
   state.peer?.destroy?.();
   state.conn = null;
@@ -265,32 +262,32 @@ function refreshDesktopSession() {
     if (state.sessionSecret !== sessionSecret || state.isClosing) return;
 
     state.sessionKeys = sessionKeys;
-    ensureDesktopUrlHasRoom(peerId);
-    createDesktopPeer(peerId);
+    ensureReceiverUrlHasRoom(peerId);
+    createReceiverPeer(peerId);
   }).catch(() => {
     state.restoreQrVisibleOnReady = false;
     setPill("暗号化エラー", "error");
-    els.desktopStatus.textContent = "暗号鍵を準備できませんでした。ページを再読み込みしてください。";
+    els.receiverStatus.textContent = "暗号鍵を準備できませんでした。ページを再読み込みしてください。";
     els.refreshQr.disabled = false;
   });
   setPill("再発行中", "warn");
-  els.desktopStatus.textContent = "新しいQRコードを発行しています";
+  els.receiverStatus.textContent = "新しいQRコードを発行しています";
 }
 
-function createDesktopSession() {
+function createReceiverSession() {
   return {
     peerId: createPeerId(),
     secret: createSessionSecret(),
   };
 }
 
-function readDesktopSession() {
+function readReceiverSession() {
   try {
-    const rawSession = window.sessionStorage?.getItem(DESKTOP_SESSION_STORAGE_KEY);
+    const rawSession = window.sessionStorage?.getItem(RECEIVER_SESSION_STORAGE_KEY);
     if (!rawSession) return null;
 
     const session = JSON.parse(rawSession);
-    if (!isValidDesktopSession(session)) return null;
+    if (!isValidReceiverSession(session)) return null;
 
     return session;
   } catch {
@@ -298,9 +295,9 @@ function readDesktopSession() {
   }
 }
 
-function writeDesktopSession(session) {
+function writeReceiverSession(session) {
   try {
-    window.sessionStorage?.setItem(DESKTOP_SESSION_STORAGE_KEY, JSON.stringify(session));
+    window.sessionStorage?.setItem(RECEIVER_SESSION_STORAGE_KEY, JSON.stringify(session));
   } catch {
     // sessionStorageが使えない場合は、現在のページ表示中だけ同じセッションを保持する。
   }
@@ -308,7 +305,7 @@ function writeDesktopSession(session) {
   return session;
 }
 
-function isValidDesktopSession(session) {
+function isValidReceiverSession(session) {
   return (
     session &&
     typeof session === "object" &&
@@ -318,40 +315,40 @@ function isValidDesktopSession(session) {
   );
 }
 
-async function startPhone(targetPeerId, sessionSecret) {
+async function startSender(targetPeerId, sessionSecret) {
   els.viewTitle.textContent = "WebRTCでファイルを送信";
   setPill("接続中", "warn");
-  els.desktopView.hidden = true;
-  els.phoneView.hidden = false;
+  els.receiverView.hidden = true;
+  els.senderView.hidden = false;
   els.unsupportedView.hidden = true;
-  setPhoneReady(false);
+  setSenderReady(false);
 
   if (!isValidSessionSecret(sessionSecret)) {
     setPill("QRエラー", "error");
-    els.phoneStatus.textContent = "QRコードに秘密鍵が含まれていません。PC側でQRコードを再発行して読み取り直してください。";
+    els.senderStatus.textContent = "QRコードに秘密鍵が含まれていません。受信側でQRコードを再発行して読み取り直してください。";
     return;
   }
 
   state.targetPeerId = targetPeerId;
   state.sessionSecret = sessionSecret;
   state.sessionKeys = await deriveSessionKeys(sessionSecret);
-  state.phoneAuthFailed = false;
+  state.senderAuthFailed = false;
 
   const peer = createPeer();
   state.peer = peer;
 
   peer.on("open", () => {
-    connectToDesktop();
+    connectToReceiver();
   });
 
   peer.on("error", (error) => {
     if (state.isClosing) return;
 
-    setPhoneReady(false);
-    els.phoneStatus.textContent = formatPeerError(error);
+    setSenderReady(false);
+    els.senderStatus.textContent = formatPeerError(error);
 
     if (error?.type === "peer-unavailable" || error?.type === "network" || error?.type === "socket-closed") {
-      schedulePhoneReconnect();
+      scheduleSenderReconnect();
       return;
     }
 
@@ -359,25 +356,24 @@ async function startPhone(targetPeerId, sessionSecret) {
   });
 }
 
-function connectToDesktop() {
+function connectToReceiver() {
   if (!state.peer?.open || !state.targetPeerId || !state.sessionKeys || state.isClosing) return;
 
-  window.clearTimeout(state.phoneReconnectTimer);
-  state.phoneReconnectTimer = null;
+  window.clearTimeout(state.senderReconnectTimer);
+  state.senderReconnectTimer = null;
 
   if (state.conn?.open) return;
 
   setPill("接続中", "warn");
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "PCへ接続しています";
+  setSenderReady(false);
+  els.senderStatus.textContent = "受信側へ接続しています";
 
   const conn = state.peer.connect(state.targetPeerId, {
     reliable: true,
-    metadata: { role: "phone", secureProtocol: SECURE_PROTOCOL_VERSION },
   });
   state.conn = conn;
   state.connAuthenticated = false;
-  state.phoneAuthFailed = false;
+  state.senderAuthFailed = false;
   attachSender(conn);
 }
 
@@ -385,25 +381,25 @@ function createPeer(id) {
   return new Peer(id);
 }
 
-function schedulePhoneReconnect() {
-  if (state.isClosing || state.phoneReconnectTimer) return;
+function scheduleSenderReconnect() {
+  if (state.isClosing || state.senderReconnectTimer) return;
 
   const delay = Math.min(
-    PHONE_RECONNECT_BASE_DELAY + state.phoneReconnectAttempts * 600,
-    PHONE_RECONNECT_MAX_DELAY,
+    SENDER_RECONNECT_BASE_DELAY + state.senderReconnectAttempts * 600,
+    SENDER_RECONNECT_MAX_DELAY,
   );
 
-  state.phoneReconnectAttempts += 1;
+  state.senderReconnectAttempts += 1;
   setPill("再接続中", "warn");
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "PCへ再接続しています";
-  state.phoneReconnectTimer = window.setTimeout(() => {
-    state.phoneReconnectTimer = null;
-    connectToDesktop();
+  setSenderReady(false);
+  els.senderStatus.textContent = "受信側へ再接続しています";
+  state.senderReconnectTimer = window.setTimeout(() => {
+    state.senderReconnectTimer = null;
+    connectToReceiver();
   }, delay);
 }
 
-function buildPhoneUrl(peerId, sessionSecret) {
+function buildSenderUrl(peerId, sessionSecret) {
   const url = new URL(window.location.href);
   url.search = "";
   url.hash = "";
@@ -412,7 +408,7 @@ function buildPhoneUrl(peerId, sessionSecret) {
   return url.toString();
 }
 
-function ensureDesktopUrlHasRoom(peerId) {
+function ensureReceiverUrlHasRoom(peerId) {
   const url = new URL(window.location.href);
   if (url.searchParams.get("room") === peerId) return;
 
@@ -434,38 +430,38 @@ function readSessionSecretFromHash() {
   return new URLSearchParams(hash).get("key") || "";
 }
 
-function setDesktopShareUrl(url, peerId) {
-  state.desktopShareUrl = url;
-  state.desktopRoomId = getRoomIdFromPeerId(peerId);
+function setReceiverShareUrl(url, peerId) {
+  state.receiverShareUrl = url;
+  state.receiverRoomId = getRoomIdFromPeerId(peerId);
   state.isQrVisible = state.restoreQrVisibleOnReady;
   state.restoreQrVisibleOnReady = false;
   updateRoomIdLabel();
-  renderDesktopQr();
-  updateDesktopQrControls();
+  renderReceiverQr();
+  updateReceiverQrControls();
 }
 
 function updateRoomIdLabel() {
-  if (!state.desktopRoomId) {
+  if (!state.receiverRoomId) {
     els.roomIdLabel.textContent = "Room ID: 準備中";
     return;
   }
 
-  els.roomIdLabel.textContent = formatRoomIdLabel(state.desktopRoomId, (label) => {
+  els.roomIdLabel.textContent = formatRoomIdLabel(state.receiverRoomId, (label) => {
     els.roomIdLabel.textContent = label;
     return els.roomIdLabel.scrollWidth <= els.roomIdLabel.clientWidth;
   });
 }
 
-function toggleDesktopQrVisibility() {
-  if (!state.desktopShareUrl || state.isClosing) return;
+function toggleReceiverQrVisibility() {
+  if (!state.receiverShareUrl || state.isClosing) return;
 
   state.isQrVisible = !state.isQrVisible;
-  renderDesktopQr();
-  updateDesktopQrControls();
+  renderReceiverQr();
+  updateReceiverQrControls();
 }
 
-function renderDesktopQr() {
-  if (!state.desktopShareUrl || !state.isQrVisible) {
+function renderReceiverQr() {
+  if (!state.receiverShareUrl || !state.isQrVisible) {
     renderQrPlaceholder();
     return;
   }
@@ -481,7 +477,7 @@ function renderDesktopQr() {
   els.qrWrap.dataset.qrVisible = "true";
   els.qrCode.replaceChildren();
   new QRCode(els.qrCode, {
-    text: state.desktopShareUrl,
+    text: state.receiverShareUrl,
     width: 256,
     height: 256,
     colorDark: "#111827",
@@ -489,7 +485,7 @@ function renderDesktopQr() {
     correctLevel: QRCode.CorrectLevel?.M ?? 0,
   });
   els.qrCode.removeAttribute("title");
-  els.qrCode.setAttribute("aria-label", "スマートフォン接続用QRコード");
+  els.qrCode.setAttribute("aria-label", "送信側接続用QRコード");
   els.qrLoading.hidden = true;
 }
 
@@ -509,8 +505,8 @@ function renderQrPlaceholder() {
   els.qrLoading.hidden = true;
 }
 
-function updateDesktopQrControls() {
-  const hasShareUrl = Boolean(state.desktopShareUrl);
+function updateReceiverQrControls() {
+  const hasShareUrl = Boolean(state.receiverShareUrl);
   const label = els.toggleQr.querySelector("span");
   const icon = els.toggleQr.querySelector("svg");
 
@@ -555,11 +551,11 @@ function createSvgCircle(cx, cy, r) {
   return circle;
 }
 
-function setDesktopQrBusy(message) {
-  state.desktopShareUrl = "";
-  state.desktopRoomId = "";
+function setReceiverQrBusy(message) {
+  state.receiverShareUrl = "";
+  state.receiverRoomId = "";
   state.isQrVisible = false;
-  updateDesktopQrControls();
+  updateReceiverQrControls();
   els.toggleQr.disabled = true;
   els.refreshQr.disabled = true;
   els.copyShareLink.disabled = true;
@@ -570,10 +566,10 @@ function setDesktopQrBusy(message) {
 }
 
 async function copyShareLink() {
-  if (!state.desktopShareUrl || els.copyShareLink.disabled) return;
+  if (!state.receiverShareUrl || els.copyShareLink.disabled) return;
 
   try {
-    await writeClipboardText(state.desktopShareUrl);
+    await writeClipboardText(state.receiverShareUrl);
     showToast("共有用リンクをコピーしました");
   } catch {
     showToast("共有用リンクをコピーできませんでした");
@@ -613,32 +609,32 @@ function showToast(message) {
   }, 2200);
 }
 
-function closeDesktopConnections() {
-  const connections = [...state.desktopConnections];
-  state.desktopConnections.clear();
-  state.authenticatedDesktopConnections.clear();
+function closeReceiverConnections() {
+  const connections = [...state.receiverConnections];
+  state.receiverConnections.clear();
+  state.authenticatedReceiverConnections.clear();
 
   for (const conn of connections) {
     conn.close?.();
   }
 }
 
-function removeDesktopConnection(conn) {
-  const wasAuthenticated = state.authenticatedDesktopConnections.delete(conn);
-  const wasKnown = state.desktopConnections.delete(conn);
+function removeReceiverConnection(conn) {
+  const wasAuthenticated = state.authenticatedReceiverConnections.delete(conn);
+  const wasKnown = state.receiverConnections.delete(conn);
   return { wasKnown, wasAuthenticated };
 }
 
-function isDesktopConnectionActive(conn) {
-  return state.desktopConnections.has(conn) && !state.isClosing;
+function isReceiverConnectionActive(conn) {
+  return state.receiverConnections.has(conn) && !state.isClosing;
 }
 
-function isDesktopConnectionAuthenticated(conn) {
-  return state.authenticatedDesktopConnections.has(conn);
+function isReceiverConnectionAuthenticated(conn) {
+  return state.authenticatedReceiverConnections.has(conn);
 }
 
-function setDesktopConnectionPill() {
-  const count = state.authenticatedDesktopConnections.size;
+function setReceiverConnectionPill() {
+  const count = state.authenticatedReceiverConnections.size;
   if (count < 1) return false;
 
   setPill(`${count}台 接続済み`, "success");
@@ -646,32 +642,32 @@ function setDesktopConnectionPill() {
 }
 
 function attachReceiver(conn) {
-  if (!setDesktopConnectionPill()) {
+  if (!setReceiverConnectionPill()) {
     setPill("認証中", "warn");
   }
-  els.desktopStatus.textContent = "スマートフォンとの接続を確認しています";
+  els.receiverStatus.textContent = "送信側との接続を確認しています";
 
   conn.on("open", () => {
-    if (!isDesktopConnectionActive(conn)) return;
+    if (!isReceiverConnectionActive(conn)) return;
 
-    if (!setDesktopConnectionPill()) {
+    if (!setReceiverConnectionPill()) {
       setPill("認証中", "warn");
     }
   });
 
   conn.on("data", (data) => {
-    if (!isDesktopConnectionActive(conn)) return;
+    if (!isReceiverConnectionActive(conn)) return;
 
     state.receiverQueue = state.receiverQueue
       .then(() => handleIncomingData(data, conn))
       .catch(() => {
-        if (!isDesktopConnectionActive(conn)) return;
+        if (!isReceiverConnectionActive(conn)) return;
 
-        removeDesktopConnection(conn);
-        if (!setDesktopConnectionPill()) {
+        removeReceiverConnection(conn);
+        if (!setReceiverConnectionPill()) {
           setPill("受信エラー", "error");
         }
-        els.desktopStatus.textContent = "受信データを復号できませんでした。QRコードを再発行してください。";
+        els.receiverStatus.textContent = "受信データを復号できませんでした。QRコードを再発行してください。";
         conn.close();
       });
   });
@@ -679,34 +675,34 @@ function attachReceiver(conn) {
   conn.on("close", () => {
     if (state.isClosing) return;
 
-    const { wasKnown, wasAuthenticated } = removeDesktopConnection(conn);
+    const { wasKnown, wasAuthenticated } = removeReceiverConnection(conn);
     if (!wasKnown && !wasAuthenticated) return;
 
-    if (setDesktopConnectionPill()) {
-      els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+    if (setReceiverConnectionPill()) {
+      els.receiverStatus.textContent = "送信側からの送信を待っています";
       return;
     }
 
     setPill(wasAuthenticated ? "切断" : "待機中", "warn");
-    els.desktopStatus.textContent = wasAuthenticated
-      ? "スマートフォンからの再接続を待っています"
-      : "スマートフォンからの送信を待っています";
+    els.receiverStatus.textContent = wasAuthenticated
+      ? "送信側からの再接続を待っています"
+      : "送信側からの送信を待っています";
   });
 
   conn.on("error", () => {
     if (state.isClosing) return;
 
-    const { wasKnown, wasAuthenticated } = removeDesktopConnection(conn);
+    const { wasKnown, wasAuthenticated } = removeReceiverConnection(conn);
     if (!wasKnown && !wasAuthenticated) return;
 
-    if (setDesktopConnectionPill()) {
-      els.desktopStatus.textContent = "一部の接続でエラーが発生しました。残りの端末からの送信を待っています";
+    if (setReceiverConnectionPill()) {
+      els.receiverStatus.textContent = "一部の接続でエラーが発生しました。残りの端末からの送信を待っています";
     } else if (wasAuthenticated) {
       setPill("受信エラー", "error");
-      els.desktopStatus.textContent = "受信中にエラーが発生しました。接続をやり直してください。";
+      els.receiverStatus.textContent = "受信中にエラーが発生しました。接続をやり直してください。";
     } else {
       setPill("待機中", "warn");
-      els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+      els.receiverStatus.textContent = "送信側からの送信を待っています";
     }
 
     conn.close();
@@ -717,11 +713,11 @@ function attachSender(conn) {
   conn.on("open", () => {
     if (state.conn !== conn) return;
 
-    state.phoneReconnectAttempts = 0;
+    state.senderReconnectAttempts = 0;
     state.connAuthenticated = false;
     setPill("認証中", "warn");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCとの接続を確認しています";
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側との接続を確認しています";
     void sendAuthHello(conn);
   });
 
@@ -735,24 +731,24 @@ function attachSender(conn) {
     if (state.conn !== conn || state.isClosing) return;
 
     state.connAuthenticated = false;
-    if (state.phoneAuthFailed) return;
+    if (state.senderAuthFailed) return;
 
     setPill("再接続中", "warn");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCへ再接続しています";
-    schedulePhoneReconnect();
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側へ再接続しています";
+    scheduleSenderReconnect();
   });
 
   conn.on("error", () => {
     if (state.conn !== conn || state.isClosing) return;
 
     state.connAuthenticated = false;
-    if (state.phoneAuthFailed) return;
+    if (state.senderAuthFailed) return;
 
     setPill("再接続中", "warn");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCへ再接続しています";
-    schedulePhoneReconnect();
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側へ再接続しています";
+    scheduleSenderReconnect();
   });
 }
 
@@ -760,7 +756,7 @@ async function sendAuthHello(conn) {
   try {
     const nonce = createAuthNonce();
     state.authNonce = nonce;
-    const token = await signAuthMessage(createAuthMessage("phone", nonce));
+    const token = await signAuthMessage(createAuthMessage("sender", nonce));
 
     if (state.conn !== conn || !conn.open || state.isClosing) return;
 
@@ -773,10 +769,10 @@ async function sendAuthHello(conn) {
   } catch {
     if (state.conn !== conn || state.isClosing) return;
 
-    state.phoneAuthFailed = true;
+    state.senderAuthFailed = true;
     setPill("認証エラー", "error");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "接続認証を開始できませんでした。QRコードを読み取り直してください。";
+    setSenderReady(false);
+    els.senderStatus.textContent = "接続認証を開始できませんでした。QRコードを読み取り直してください。";
     conn.close();
   }
 }
@@ -791,18 +787,18 @@ async function handleAuthHello(data, conn) {
     return;
   }
 
-  const isValid = await verifyAuthMessage(createAuthMessage("phone", data.nonce), data.token);
+  const isValid = await verifyAuthMessage(createAuthMessage("sender", data.nonce), data.token);
   if (!isValid) {
     rejectUnauthenticatedConnection(conn);
     return;
   }
 
-  const token = await signAuthMessage(createAuthMessage("desktop", data.nonce));
-  if (!isDesktopConnectionActive(conn) || !conn.open) return;
+  const token = await signAuthMessage(createAuthMessage("receiver", data.nonce));
+  if (!isReceiverConnectionActive(conn) || !conn.open) return;
 
-  state.authenticatedDesktopConnections.add(conn);
-  setDesktopConnectionPill();
-  els.desktopStatus.textContent = "スマートフォンからの送信を待っています";
+  state.authenticatedReceiverConnections.add(conn);
+  setReceiverConnectionPill();
+  els.receiverStatus.textContent = "送信側からの送信を待っています";
   conn.send({
     type: "auth-ok",
     version: SECURE_PROTOCOL_VERSION,
@@ -816,10 +812,10 @@ async function handleSenderData(data, conn) {
 
   if (data.type === "auth-error") {
     state.connAuthenticated = false;
-    state.phoneAuthFailed = true;
+    state.senderAuthFailed = true;
     setPill("認証エラー", "error");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCとの接続認証に失敗しました。QRコードを読み取り直してください。";
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側との接続認証に失敗しました。QRコードを読み取り直してください。";
     conn.close();
     return;
   }
@@ -832,42 +828,42 @@ async function handleSenderData(data, conn) {
     typeof data.token !== "string"
   ) {
     state.connAuthenticated = false;
-    state.phoneAuthFailed = true;
+    state.senderAuthFailed = true;
     setPill("認証エラー", "error");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCからの認証応答を確認できませんでした。QRコードを読み取り直してください。";
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側からの認証応答を確認できませんでした。QRコードを読み取り直してください。";
     conn.close();
     return;
   }
 
-  const isValid = await verifyAuthMessage(createAuthMessage("desktop", data.nonce), data.token);
+  const isValid = await verifyAuthMessage(createAuthMessage("receiver", data.nonce), data.token);
   if (state.conn !== conn || state.isClosing) return;
 
   if (!isValid) {
     state.connAuthenticated = false;
-    state.phoneAuthFailed = true;
+    state.senderAuthFailed = true;
     setPill("認証エラー", "error");
-    setPhoneReady(false);
-    els.phoneStatus.textContent = "PCとの接続認証に失敗しました。QRコードを読み取り直してください。";
+    setSenderReady(false);
+    els.senderStatus.textContent = "受信側との接続認証に失敗しました。QRコードを読み取り直してください。";
     conn.close();
     return;
   }
 
   state.connAuthenticated = true;
-  state.phoneAuthFailed = false;
+  state.senderAuthFailed = false;
   state.authNonce = null;
   setPill("接続済み", "success");
-  setPhoneReady(isConnectionReady());
-  els.phoneStatus.textContent = "暗号化接続を確認しました。送信するファイルを選択してください";
+  setSenderReady(isConnectionReady());
+  els.senderStatus.textContent = "暗号化接続を確認しました。送信するファイルを選択してください";
 }
 
 function rejectUnauthenticatedConnection(conn) {
-  if (state.desktopConnections.has(conn) && !state.isClosing) {
-    removeDesktopConnection(conn);
-    if (!setDesktopConnectionPill()) {
+  if (state.receiverConnections.has(conn) && !state.isClosing) {
+    removeReceiverConnection(conn);
+    if (!setReceiverConnectionPill()) {
       setPill("認証エラー", "error");
     }
-    els.desktopStatus.textContent = "接続認証に失敗しました。QRコードを再発行してください。";
+    els.receiverStatus.textContent = "接続認証に失敗しました。QRコードを再発行してください。";
   }
 
   if (conn.open) {
@@ -961,7 +957,7 @@ async function handleIncomingData(data, conn) {
     return;
   }
 
-  if (!isDesktopConnectionAuthenticated(conn)) {
+  if (!isReceiverConnectionAuthenticated(conn)) {
     rejectUnauthenticatedConnection(conn);
     return;
   }
@@ -975,7 +971,7 @@ async function handleIncomingData(data, conn) {
       receivedChunks: 0,
       element: createReceivingItem(meta),
     });
-    els.desktopStatus.textContent = `${meta.name} を受信しています`;
+    els.receiverStatus.textContent = `${meta.name} を受信しています`;
     return;
   }
 
@@ -1086,8 +1082,8 @@ function completeReceivingItem(id, transfer) {
   });
 
   state.incomingTransfers.delete(id);
-  setDesktopConnectionPill();
-  els.desktopStatus.textContent = "受信が完了しました。スマートフォンからの次の送信を待っています";
+  setReceiverConnectionPill();
+  els.receiverStatus.textContent = "受信が完了しました。送信側からの次の送信を待っています";
   openPreview();
 }
 
@@ -1201,7 +1197,7 @@ async function handleFilePicked(event) {
   try {
     await showSelectedFilePreview(file, "file");
   } catch {
-    els.phoneStatus.textContent = "プレビュー処理中にエラーが発生しました。送信はやり直してください。";
+    els.senderStatus.textContent = "プレビュー処理中にエラーが発生しました。送信はやり直してください。";
     clearPendingFile();
   }
 }
@@ -1210,7 +1206,7 @@ async function openAppCamera() {
   clearPendingFile();
 
   if (!navigator.mediaDevices?.getUserMedia) {
-    els.phoneStatus.textContent = "このブラウザではアプリ内カメラを利用できません。";
+    els.senderStatus.textContent = "このブラウザではアプリ内カメラを利用できません。";
     return;
   }
 
@@ -1218,8 +1214,8 @@ async function openAppCamera() {
   state.appCameraRequestId = requestId;
   state.isOpeningAppCamera = true;
   els.appCameraPanel.hidden = false;
-  els.phoneStatus.textContent = "アプリ内カメラを起動しています";
-  setPhoneReady(false);
+  els.senderStatus.textContent = "アプリ内カメラを起動しています";
+  setSenderReady(false);
 
   try {
     await ensureAppCameraOrientationTracking();
@@ -1243,18 +1239,18 @@ async function openAppCamera() {
     }
 
     startAppCameraPreview();
-    els.phoneStatus.textContent = "アプリ内カメラで撮影できます";
+    els.senderStatus.textContent = "アプリ内カメラで撮影できます";
   } catch {
     if (requestId === state.appCameraRequestId) {
       stopAppCameraStream();
       els.appCameraPanel.hidden = true;
-      els.phoneStatus.textContent = "アプリ内カメラを起動できませんでした。カメラを起動する方法を試してください。";
-      setPhoneReady(isConnectionReady());
+      els.senderStatus.textContent = "アプリ内カメラを起動できませんでした。カメラを起動する方法を試してください。";
+      setSenderReady(isConnectionReady());
     }
   } finally {
     if (requestId === state.appCameraRequestId) {
       state.isOpeningAppCamera = false;
-      setPhoneReady(isConnectionReady());
+      setSenderReady(isConnectionReady());
     }
   }
 }
@@ -1327,15 +1323,15 @@ async function captureAppCamera() {
   if (state.isCapturingAppCamera || !state.appCameraStream || !video.videoWidth || !video.videoHeight) return;
 
   state.isCapturingAppCamera = true;
-  setPhoneReady(false);
-  els.phoneStatus.textContent = "撮影した写真を作成しています";
+  setSenderReady(false);
+  els.senderStatus.textContent = "撮影した写真を作成しています";
 
   const canvas = createAppCameraSnapshotCanvas(video);
   if (!canvas) {
     state.isCapturingAppCamera = false;
     stopAppCameraStream();
-    els.phoneStatus.textContent = "撮影画像を作成できませんでした。";
-    setPhoneReady(isConnectionReady());
+    els.senderStatus.textContent = "撮影画像を作成できませんでした。";
+    setSenderReady(isConnectionReady());
     return;
   }
 
@@ -1348,15 +1344,15 @@ async function captureAppCamera() {
 
     stopAppCameraStream();
     await showSelectedFilePreview(file, "app-camera");
-    els.phoneStatus.textContent = "撮影した写真を確認してください";
+    els.senderStatus.textContent = "撮影した写真を確認してください";
   } catch {
-    els.phoneStatus.textContent = "撮影画像を作成できませんでした。もう一度撮影してください。";
-    setPhoneReady(isConnectionReady());
+    els.senderStatus.textContent = "撮影画像を作成できませんでした。もう一度撮影してください。";
+    setSenderReady(isConnectionReady());
   } finally {
     state.isCapturingAppCamera = false;
     canvas.width = 0;
     canvas.height = 0;
-    setPhoneReady(isConnectionReady());
+    setSenderReady(isConnectionReady());
   }
 }
 
@@ -1626,21 +1622,12 @@ async function showSelectedFilePreview(file, source) {
   } else {
     renderPreviewMessage(els.fileReviewContent, skipPreviewMessage);
   }
-  els.phoneStatus.textContent = "送信するファイルを確認してください";
-  setPhoneReady(isConnectionReady());
+  els.senderStatus.textContent = "送信するファイルを確認してください";
+  setSenderReady(isConnectionReady());
 }
 
 function formatSelectedFileDetail(file) {
   return `${formatBytes(file.size)} / ${file.type || "application/octet-stream"}`;
-}
-
-function clearObsoleteStorage() {
-  try {
-    window.localStorage?.removeItem(OBSOLETE_DESKTOP_PEER_STORAGE_KEY);
-    window.localStorage?.removeItem("qr-transfer-debug-log");
-  } catch {
-    // Ignore storage cleanup failures.
-  }
 }
 
 function renderPreviewMessage(container, message) {
@@ -1690,13 +1677,13 @@ function clearPendingFile() {
   els.chooseAnotherFile.textContent = "選び直す";
   els.fileReviewContent.replaceChildren();
   els.fileReviewContent.dataset.previewKind = "empty";
-  setPhoneReady(isConnectionReady());
+  setSenderReady(isConnectionReady());
 }
 
 function closeAppCamera() {
   stopAppCameraStream();
-  els.phoneStatus.textContent = "送信するファイルを選択してください";
-  setPhoneReady(isConnectionReady());
+  els.senderStatus.textContent = "送信するファイルを選択してください";
+  setSenderReady(isConnectionReady());
 }
 
 function stopAppCameraStream() {
@@ -1726,16 +1713,16 @@ async function sendFile(file) {
   const totalChunks = Math.max(1, Math.ceil(file.size / TRANSFER_CHUNK_SIZE));
   if (!canSendFile(file, totalChunks)) {
     setPill("送信不可", "error");
-    els.phoneStatus.textContent = "このファイルは送信できません。ファイル名またはサイズを確認してください。";
+    els.senderStatus.textContent = "このファイルは送信できません。ファイル名またはサイズを確認してください。";
     return false;
   }
 
   state.isSending = true;
-  setPhoneReady(false);
+  setSenderReady(false);
   setPill("送信中", "warn");
   els.sendProgress.hidden = false;
   els.sendProgress.value = 0;
-  els.phoneStatus.textContent = `${file.name} を送信しています`;
+  els.senderStatus.textContent = `${file.name} を送信しています`;
 
   const id = window.crypto.randomUUID?.() || `transfer-${bytesToBase64Url(createRandomBytes(16))}`;
 
@@ -1771,14 +1758,14 @@ async function sendFile(file) {
     }
 
     setPill("送信完了", "success");
-    els.phoneStatus.textContent = "送信が完了しました。続けて別のファイルも送信できます";
+    els.senderStatus.textContent = "送信が完了しました。続けて別のファイルも送信できます";
     didSend = true;
   } catch {
     setPill("送信エラー", "error");
-    els.phoneStatus.textContent = "送信中にエラーが発生しました。接続を確認してやり直してください。";
+    els.senderStatus.textContent = "送信中にエラーが発生しました。接続を確認してやり直してください。";
   } finally {
     state.isSending = false;
-    setPhoneReady(isConnectionReady());
+    setSenderReady(isConnectionReady());
     els.sendProgress.hidden = true;
   }
 
@@ -1809,14 +1796,14 @@ function waitForBuffer(conn) {
 
 function cleanup() {
   state.isClosing = true;
-  window.clearTimeout(state.desktopRetryTimer);
-  window.clearTimeout(state.phoneReconnectTimer);
+  window.clearTimeout(state.receiverRetryTimer);
+  window.clearTimeout(state.senderReconnectTimer);
   window.removeEventListener("deviceorientation", handleAppCameraDeviceOrientation, true);
   stopAppCameraStream();
   for (const url of [...state.objectUrls]) {
     revokeObjectUrl(url);
   }
-  closeDesktopConnections();
+  closeReceiverConnections();
   state.conn?.close?.();
   state.peer?.destroy?.();
 }
@@ -1825,7 +1812,7 @@ function isConnectionReady() {
   return Boolean(state.conn?.open && state.connAuthenticated);
 }
 
-function setPhoneReady(isReady) {
+function setSenderReady(isReady) {
   const appCameraBusy = state.isOpeningAppCamera || Boolean(state.appCameraStream);
 
   els.pickFile.disabled = !isReady || appCameraBusy;
@@ -1919,7 +1906,7 @@ function formatPeerError(error) {
   const messages = {
     "browser-incompatible": "このブラウザはWebRTCに対応していません。",
     network: "PeerJSのシグナリングサーバーに接続できません。ネットワークを確認してください。",
-    "peer-unavailable": "PCの接続IDが見つかりません。QRコードを読み取り直してください。",
+    "peer-unavailable": "受信側の接続IDが見つかりません。QRコードを読み取り直してください。",
     "server-error": "PeerJSのシグナリングサーバーでエラーが発生しました。時間をおいて再試行してください。",
     "socket-error": "PeerJSサーバーとの接続でエラーが発生しました。",
     "socket-closed": "PeerJSサーバーとの接続が閉じられました。",

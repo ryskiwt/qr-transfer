@@ -22,8 +22,8 @@
           <span id="connection-pill" class="pill">準備中</span>
         </header>
 
-        <section id="desktop-view" class="view" hidden>
-          <div class="desktop-grid">
+        <section id="receiver-view" class="view" hidden>
+          <div class="receiver-grid">
             <div class="qr-panel">
               <div class="qr-top-actions">
                 <button id="toggle-qr" class="secondary-button" type="button" aria-pressed="false">
@@ -44,7 +44,7 @@
                 </button>
               </div>
               <div id="qr-wrap" class="qr-wrap">
-                <div id="qr-code" class="qr-code" role="img" aria-label="スマートフォン接続用QRコード"></div>
+                <div id="qr-code" class="qr-code" role="img" aria-label="送信側接続用QRコード"></div>
                 <div id="qr-loading" class="qr-loading">QRコードを生成中</div>
               </div>
               <div class="qr-actions">
@@ -78,7 +78,7 @@
             </section>
           </div>
 
-          <p id="desktop-status" class="sr-only">スマートフォンからの送信を待っています</p>
+          <p id="receiver-status" class="sr-only">送信側からの送信を待っています</p>
 
           <section class="receive-area" aria-label="受信ファイル">
             <div class="section-heading">
@@ -90,8 +90,8 @@
           </section>
         </section>
 
-        <section id="phone-view" class="view" hidden>
-          <p id="phone-status-text" class="sr-only">PCへ接続しています</p>
+        <section id="sender-view" class="view" hidden>
+          <p id="sender-status-text" class="sr-only">受信側へ接続しています</p>
           <progress id="send-progress" max="100" value="0" hidden></progress>
 
           <div class="action-grid">

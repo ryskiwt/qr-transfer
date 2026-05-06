@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check app.js",
+    "build:pages": "node scripts/prepare-site.mjs _site",
+    "check": "node --check app.js && node --check scripts/prepare-site.mjs && node --check scripts/generate-release-metadata.mjs && node --check scripts/verify-vendor.mjs && npm run verify:vendor",
+    "release:metadata": "node scripts/generate-release-metadata.mjs _site qr-transfer-site.spdx.json site.sha256",
+    "verify:vendor": "node scripts/verify-vendor.mjs",
     "test": "node --test"
   }
 }

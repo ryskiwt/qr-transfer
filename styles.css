@@ -132,7 +132,7 @@ h2 {
   white-space: nowrap;
 }
 
-.desktop-grid {
+.receiver-grid {
   display: grid;
   grid-template-columns: minmax(280px, 0.9fr) minmax(280px, 1.1fr);
   gap: 20px;
@@ -316,7 +316,7 @@ h2 {
   background: #f8fafc;
 }
 
-.desktop-grid .preview-content {
+.receiver-grid .preview-content {
   height: clamp(340px, 32vw, 400px);
 }
 
@@ -686,7 +686,7 @@ progress::-moz-progress-bar {
     text-overflow: ellipsis;
   }
 
-  .desktop-grid,
+  .receiver-grid,
   .action-grid {
     grid-template-columns: 1fr;
   }

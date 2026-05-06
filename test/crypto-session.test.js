@@ -31,7 +31,7 @@ test("HMAC auth signs and verifies protocol messages", async () => {
   assert.equal(isSecureCryptoSupported(), true);
 
   const keys = await deriveSessionKeys(createSessionSecret());
-  const message = createAuthMessage("phone", createAuthNonce());
+  const message = createAuthMessage("sender", createAuthNonce());
   const token = await signAuthMessage(keys, message);
 
   assert.equal(await verifyAuthMessage(keys, message, token), true);
